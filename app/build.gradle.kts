@@ -31,8 +31,8 @@ android {
         targetSdk = 35       // Android 15
         // Pre-release baseline. `bin/changeset` bumps these on every release —
         // the first cut takes this to 0.1.0 / versionCode 1.
-        versionCode = 0
-        versionName = "0.0.0"
+        versionCode = 1
+        versionName = "0.1.0"
     }
 
     signingConfigs {
