@@ -1,0 +1,18 @@
+*.iml
+.gradle
+/.idea
+.DS_Store
+.externalNativeBuild
+.cxx
+/captures
+
+# Gradle build output — in any module, not just the root.
+build/
+
+# Local SDK path, generated per-machine.
+local.properties
+
+# Signing materials never go into git
+keystore.properties
+*.jks
+*.keystore
