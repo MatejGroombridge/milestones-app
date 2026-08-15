@@ -119,4 +119,8 @@ dependencies {
     // Persistence
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.serialization.json)
+
+    // Unit tests. The model layer is pure Kotlin — no Android dependencies —
+    // so the migration and the kind × cadence maths are testable on the JVM.
+    testImplementation(libs.junit)
 }

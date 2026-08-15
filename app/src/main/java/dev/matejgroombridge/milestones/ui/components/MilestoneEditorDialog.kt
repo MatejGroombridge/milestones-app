@@ -29,10 +29,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
 import dev.matejgroombridge.milestones.data.model.MilestoneDirection
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
 import dev.matejgroombridge.milestones.data.model.MilestoneUnit
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 
@@ -43,13 +44,16 @@ sealed interface MilestoneEditorResult {
         val description: String,
         val iconKey: String,
         val colorKey: String,
+        val kind: MilestoneKind,
+        val cadence: MilestoneCadence,
         val unit: MilestoneUnit,
         val direction: MilestoneDirection,
         val target: Double?,
         /**
-         * Seeds the first record on creation, so a user who already knows
-         * their current best doesn't have to create-then-log. Always null in
-         * edit mode — existing records are managed from the overview dialog.
+         * Seeds the first entry on creation, so a user who already knows
+         * their current best (or count) doesn't have to create-then-log.
+         * Always null in edit mode — existing entries are managed from the
+         * overview dialog.
          */
         val startingValue: Double?,
     ) : MilestoneEditorResult
@@ -69,14 +73,21 @@ private enum class UnitKind { Number, Time, Money }
  * the top-left opens a combined icon + colour picker; colour is randomised on
  * creation so a fresh grid isn't all one shade.
  *
+ * The two pickers that matter most sit directly under the name, because they
+ * decide everything below them: [MilestoneKind] changes what an entry means
+ * (and whether direction applies at all), and [MilestoneCadence] changes which
+ * section of the grid the milestone lands in.
+ *
  * For edit mode, archive is a small icon-only action at the top-right of the
  * title row. Deletion is intentionally not available here — to delete a
  * milestone the user must first archive it and then delete from the Archive
- * screen, which protects against accidental loss of record history.
+ * screen, which protects against accidental loss of history.
  */
 @Composable
 fun MilestoneEditorDialog(
     existing: Milestone?,
+    /** The target currently being chased, so edit mode can show and change it. */
+    activeTarget: Double?,
     onDismiss: () -> Unit,
     onResult: (MilestoneEditorResult) -> Unit,
 ) {
@@ -88,6 +99,8 @@ fun MilestoneEditorDialog(
     var colorKey by remember {
         mutableStateOf(existing?.colorKey ?: MilestoneColors.palette.random().key)
     }
+    var kind by remember { mutableStateOf(existing?.kind ?: MilestoneKind.Default) }
+    var cadence by remember { mutableStateOf(existing?.cadence ?: MilestoneCadence.Default) }
     var direction by remember {
         mutableStateOf(existing?.direction ?: MilestoneDirection.Default)
     }
@@ -112,8 +125,8 @@ fun MilestoneEditorDialog(
         mutableStateOf((initialUnit as? MilestoneUnit.Money)?.symbol ?: "£")
     }
 
-    // Rebuilt on every keystroke so the target / starting-value fields parse
-    // and preview against the unit the user is currently configuring.
+    // Rebuilt on every keystroke so the target and starting-value fields parse
+    // against the unit the user is currently configuring.
     val unit: MilestoneUnit = when (unitKind) {
         UnitKind.Number -> MilestoneUnit.Numeric(
             suffix = suffix.trim(),
@@ -124,7 +137,7 @@ fun MilestoneEditorDialog(
     }
 
     var rawTarget by remember {
-        mutableStateOf(existing?.target?.let { initialUnit.format(it) }.orEmpty())
+        mutableStateOf(activeTarget?.let { initialUnit.format(it) }.orEmpty())
     }
     var rawStartingValue by remember { mutableStateOf("") }
 
@@ -142,8 +155,14 @@ fun MilestoneEditorDialog(
                 description = description,
                 iconKey = iconKey,
                 colorKey = colorKey,
+                kind = kind,
+                cadence = cadence,
                 unit = unit,
-                direction = direction,
+                // A tally only climbs; whatever the direction picker last
+                // showed is irrelevant, and the repository enforces this too.
+                direction = if (kind == MilestoneKind.Tally) {
+                    MilestoneDirection.HigherIsBetter
+                } else direction,
                 target = target,
                 startingValue = startingValue,
             ),
@@ -213,12 +232,55 @@ fun MilestoneEditorDialog(
                     )
                 }
 
-                // --- Unit card ---
+                // --- Kind ---
+                CaptionedSection(
+                    caption = "What you're tracking",
+                    helpText = "A personal best keeps only your single best " +
+                        "result — a 5km time, a bench press. A running total " +
+                        "counts events as they happen — books read, countries " +
+                        "visited — so each entry adds to the tally.",
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MilestoneKind.entries.forEach { option ->
+                            ChoiceCell(
+                                label = option.label,
+                                subtitle = option.blurb,
+                                selected = kind == option,
+                                onClick = { kind = option },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+
+                // --- Cadence ---
+                CaptionedSection(
+                    caption = "Scored over",
+                    helpText = "All time is a lifetime record that never " +
+                        "resets. Each year gives every calendar year its own " +
+                        "scoreboard and its own target, so this year's goals " +
+                        "sit apart from your lifetime bests on the grid.",
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MilestoneCadence.entries.forEach { option ->
+                            ChoiceCell(
+                                label = option.label,
+                                subtitle = option.blurb,
+                                selected = cadence == option,
+                                onClick = { cadence = option },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+
+                // --- Unit ---
                 CaptionedSection(
                     caption = "Measured in",
-                    helpText = "How values are typed in and displayed. Times are " +
-                        "entered as 24:30 or 1:23:45. Changing this later only " +
-                        "relabels your existing records — it doesn't convert them.",
+                    helpText = "How values are typed in and displayed. Times " +
+                        "are entered as 24:30 or 1:23:45. Changing this later " +
+                        "only relabels your existing entries — it doesn't " +
+                        "convert them.",
                 ) {
                     UnitPicker(
                         kind = unitKind,
@@ -232,37 +294,39 @@ fun MilestoneEditorDialog(
                     )
                 }
 
-                // --- Direction card ---
-                CaptionedSection(
-                    caption = "Beating it means",
-                    helpText = "Books read and revenue go up; a 5km time or a " +
-                        "weight to cut goes down. This decides which values " +
-                        "count as a new record.",
-                ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        ChoiceCell(
-                            label = "Higher",
-                            subtitle = "e.g. distance",
-                            selected = direction == MilestoneDirection.HigherIsBetter,
-                            onClick = { direction = MilestoneDirection.HigherIsBetter },
-                            modifier = Modifier.weight(1f),
-                        )
-                        ChoiceCell(
-                            label = "Lower",
-                            subtitle = "e.g. a time",
-                            selected = direction == MilestoneDirection.LowerIsBetter,
-                            onClick = { direction = MilestoneDirection.LowerIsBetter },
-                            modifier = Modifier.weight(1f),
-                        )
+                // --- Direction (records only; a tally can only climb) ---
+                if (kind.hasDirection) {
+                    CaptionedSection(
+                        caption = "Beating it means",
+                        helpText = "Distance and revenue go up; a 5km time or " +
+                            "a weight to cut goes down. This decides which " +
+                            "values count as a new record.",
+                    ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ChoiceCell(
+                                label = "Higher",
+                                subtitle = "e.g. distance",
+                                selected = direction == MilestoneDirection.HigherIsBetter,
+                                onClick = { direction = MilestoneDirection.HigherIsBetter },
+                                modifier = Modifier.weight(1f),
+                            )
+                            ChoiceCell(
+                                label = "Lower",
+                                subtitle = "e.g. a time",
+                                selected = direction == MilestoneDirection.LowerIsBetter,
+                                onClick = { direction = MilestoneDirection.LowerIsBetter },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
                     }
                 }
 
-                // --- Target card ---
+                // --- Target ---
                 CaptionedSection(
                     caption = "Target",
-                    helpText = "Optional. Setting one turns the card's subtitle " +
-                        "into a progress bar and marks the milestone as reached " +
-                        "once you get there.",
+                    helpText = "Optional. Setting one turns the card into a " +
+                        "progress bar, and reaching it offers you the next " +
+                        "target on the same milestone rather than ending there.",
                 ) {
                     OutlinedTextField(
                         value = rawTarget,
@@ -271,29 +335,34 @@ fun MilestoneEditorDialog(
                         placeholder = { Text(unit.fieldPlaceholder) },
                         singleLine = true,
                         isError = rawTarget.isNotBlank() && target == null,
-                        keyboardOptions = KeyboardOptions(keyboardType = keyboardFor(unit)),
+                        keyboardOptions = KeyboardOptions(keyboardType = keyboardTypeFor(unit)),
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
 
                 // --- Starting value (create only) ---
-                // Editing an existing milestone's records happens in the
+                // Editing an existing milestone's entries happens in the
                 // overview dialog, so this only makes sense at creation time.
                 if (!isEdit) {
                     CaptionedSection(
-                        caption = "Current best",
-                        helpText = "Optional. If you already have a personal " +
-                            "best, enter it here and it becomes your first " +
-                            "record — no need to create then log.",
+                        caption = if (kind == MilestoneKind.Tally) "Starting count" else "Current best",
+                        helpText = "Optional. If you're already partway there, " +
+                            "enter where you stand and it becomes your first " +
+                            "entry — no need to create then log.",
                     ) {
                         OutlinedTextField(
                             value = rawStartingValue,
                             onValueChange = { rawStartingValue = it },
-                            label = { Text("Starting value (optional)") },
+                            label = {
+                                Text(
+                                    if (kind == MilestoneKind.Tally) "Starting count (optional)"
+                                    else "Current best (optional)",
+                                )
+                            },
                             placeholder = { Text(unit.fieldPlaceholder) },
                             singleLine = true,
                             isError = rawStartingValue.isNotBlank() && startingValue == null,
-                            keyboardOptions = KeyboardOptions(keyboardType = keyboardFor(unit)),
+                            keyboardOptions = KeyboardOptions(keyboardType = keyboardTypeFor(unit)),
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
@@ -324,7 +393,7 @@ fun MilestoneEditorDialog(
 /**
  * Three equally-weighted cells for the unit families, with the options that
  * belong to the selected one appearing directly underneath. Same shape as the
- * direction picker so the two cards read as a pair.
+ * other pickers so the cards read as a set.
  */
 @Composable
 private fun UnitPicker(
@@ -379,7 +448,8 @@ private fun UnitPicker(
                         min = 0,
                         max = MilestoneUnit.MAX_DECIMALS,
                         label = { v ->
-                            if (v == 0) "Whole numbers" else "$v decimal place${if (v == 1) "" else "s"}"
+                            if (v == 0) "Whole numbers"
+                            else "$v decimal place${if (v == 1) "" else "s"}"
                         },
                     )
                 }
@@ -399,11 +469,4 @@ private fun UnitPicker(
             )
         }
     }
-}
-
-/** Matches [LogRecordDialog]'s keyboard choice so entry feels the same everywhere. */
-private fun keyboardFor(unit: MilestoneUnit): KeyboardType = when (unit) {
-    is MilestoneUnit.Time -> KeyboardType.Text
-    is MilestoneUnit.Money -> KeyboardType.Decimal
-    is MilestoneUnit.Numeric -> if (unit.decimals > 0) KeyboardType.Decimal else KeyboardType.Number
 }

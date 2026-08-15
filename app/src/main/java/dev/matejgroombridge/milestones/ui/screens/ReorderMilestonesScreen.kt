@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -42,7 +41,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
+import dev.matejgroombridge.milestones.data.model.MilestoneStats
 import dev.matejgroombridge.milestones.ui.HomeViewModel
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
@@ -53,9 +53,14 @@ import dev.matejgroombridge.milestones.ui.util.rememberHaptics
  * rather than a drag-and-drop pointer modifier to stay accessible and
  * dependency-free.
  *
- * Order is held in local state while the user is rearranging, then committed
- * via [HomeViewModel.setOrdering] on every change so closing the screen never
- * leaves a stale order behind.
+ * Reordering happens *within* a cadence group, mirroring how the grid is laid
+ * out — moving a yearly goal "up" past the last lifetime record would be
+ * meaningless, since they're drawn in separate sections. Committing the two
+ * groups back concatenated also normalises the stored list to be contiguous by
+ * group instead of interleaved.
+ *
+ * Order is held locally while rearranging and committed on every change, so
+ * closing the screen never leaves a stale order behind.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -65,18 +70,31 @@ fun ReorderMilestonesScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
-    // Mirror the active list locally so reorders are instantly reflected
-    // without waiting for the upstream flow to round-trip through DataStore.
-    var localOrder by remember(state.activeMilestones) {
-        mutableStateOf(state.activeMilestones)
-    }
+    // Mirror the lists locally so reorders are instantly reflected without
+    // waiting for the upstream flow to round-trip through DataStore.
+    var yearly by remember(state.yearly) { mutableStateOf(state.yearly) }
+    var lifetime by remember(state.lifetime) { mutableStateOf(state.lifetime) }
     val haptics = rememberHaptics()
 
-    fun commit(newOrder: List<Milestone>) {
-        localOrder = newOrder
-        viewModel.setOrdering(newOrder.map { it.id })
+    fun commit(newYearly: List<MilestoneStats>, newLifetime: List<MilestoneStats>) {
+        yearly = newYearly
+        lifetime = newLifetime
+        viewModel.setOrdering((newYearly + newLifetime).map { it.milestone.id })
         haptics.light()
     }
+
+    fun move(cadence: MilestoneCadence, index: Int, delta: Int) {
+        val group = if (cadence == MilestoneCadence.Yearly) yearly else lifetime
+        val destination = index + delta
+        if (destination !in group.indices) return
+        val reordered = group.toMutableList().apply {
+            add(destination, removeAt(index))
+        }
+        if (cadence == MilestoneCadence.Yearly) commit(reordered, lifetime)
+        else commit(yearly, reordered)
+    }
+
+    val showHeaders = yearly.isNotEmpty() && lifetime.isNotEmpty()
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -97,7 +115,7 @@ fun ReorderMilestonesScreen(
             )
         },
     ) { padding ->
-        if (localOrder.isEmpty()) {
+        if (yearly.isEmpty() && lifetime.isEmpty()) {
             EmptyReorderHint(padding)
             return@Scaffold
         }
@@ -108,49 +126,73 @@ fun ReorderMilestonesScreen(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(localOrder, key = { it.id }) { milestone ->
-                val index = localOrder.indexOfFirst { it.id == milestone.id }
-                ReorderRow(
-                    milestone = milestone,
-                    canMoveUp = index > 0,
-                    canMoveDown = index < localOrder.lastIndex,
-                    onMoveUp = {
-                        if (index > 0) {
-                            val mutable = localOrder.toMutableList()
-                            val item = mutable.removeAt(index)
-                            mutable.add(index - 1, item)
-                            commit(mutable)
-                        }
-                    },
-                    onMoveDown = {
-                        if (index < localOrder.lastIndex) {
-                            val mutable = localOrder.toMutableList()
-                            val item = mutable.removeAt(index)
-                            mutable.add(index + 1, item)
-                            commit(mutable)
-                        }
-                    },
-                )
+            listOf(
+                MilestoneCadence.Yearly to yearly,
+                MilestoneCadence.Lifetime to lifetime,
+            ).forEach { (cadence, group) ->
+                if (group.isEmpty()) return@forEach
+                if (showHeaders) {
+                    item(key = "header-${cadence.name}") {
+                        SectionCaption(cadence.sectionTitle)
+                    }
+                }
+                milestoneRows(group, cadence) { index, stats ->
+                    ReorderRow(
+                        stats = stats,
+                        canMoveUp = index > 0,
+                        canMoveDown = index < group.lastIndex,
+                        onMoveUp = { move(cadence, index, -1) },
+                        onMoveDown = { move(cadence, index, +1) },
+                    )
+                }
             }
         }
     }
 
-    // If the upstream list adds/removes milestones while we're on this screen
-    // (e.g. one created elsewhere), pull in the new authoritative order so
-    // localOrder doesn't drift permanently.
+    // If the upstream list changes while we're on this screen (e.g. a
+    // milestone created elsewhere), pull in the new authoritative order so
+    // the local copies don't drift permanently.
     LaunchedEffect(state.activeMilestones.map { it.id }) {
-        localOrder = state.activeMilestones
+        yearly = state.yearly
+        lifetime = state.lifetime
+    }
+}
+
+/**
+ * Emits one row per milestone, keyed by cadence as well as id so the two
+ * groups can't collide. Named distinctly from the stdlib `itemsIndexed` to
+ * avoid a confusing overload at the call site.
+ */
+private fun androidx.compose.foundation.lazy.LazyListScope.milestoneRows(
+    group: List<MilestoneStats>,
+    cadence: MilestoneCadence,
+    content: @Composable (Int, MilestoneStats) -> Unit,
+) {
+    group.forEachIndexed { index, stats ->
+        item(key = "${cadence.name}-${stats.milestone.id}") { content(index, stats) }
     }
 }
 
 @Composable
+private fun SectionCaption(text: String) {
+    Text(
+        text = text.uppercase(),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(start = 6.dp, top = 8.dp),
+    )
+}
+
+@Composable
 private fun ReorderRow(
-    milestone: Milestone,
+    stats: MilestoneStats,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
 ) {
+    val milestone = stats.milestone
     val color = MilestoneColors.entry(milestone.colorKey)
     val icon = MilestoneIcons.entry(milestone.iconKey)
     Surface(
@@ -186,19 +228,13 @@ private fun ReorderRow(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(
-                onClick = onMoveUp,
-                enabled = canMoveUp,
-            ) {
+            IconButton(onClick = onMoveUp, enabled = canMoveUp) {
                 Icon(
                     imageVector = Icons.Outlined.KeyboardArrowUp,
                     contentDescription = "Move up",
                 )
             }
-            IconButton(
-                onClick = onMoveDown,
-                enabled = canMoveDown,
-            ) {
+            IconButton(onClick = onMoveDown, enabled = canMoveDown) {
                 Icon(
                     imageVector = Icons.Outlined.KeyboardArrowDown,
                     contentDescription = "Move down",

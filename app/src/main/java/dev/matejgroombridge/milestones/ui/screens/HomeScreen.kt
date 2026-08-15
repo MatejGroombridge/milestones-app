@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
@@ -20,40 +21,58 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.data.model.MilestoneStats
+import dev.matejgroombridge.milestones.data.model.MilestoneTarget
 import dev.matejgroombridge.milestones.ui.HomeViewModel
 import dev.matejgroombridge.milestones.ui.SettingsViewModel
 import dev.matejgroombridge.milestones.ui.components.ConfettiOverlay
-import dev.matejgroombridge.milestones.ui.components.LogRecordDialog
+import dev.matejgroombridge.milestones.ui.components.LogEntryDialog
 import dev.matejgroombridge.milestones.ui.components.MilestoneCard
 import dev.matejgroombridge.milestones.ui.components.MilestoneEditorDialog
 import dev.matejgroombridge.milestones.ui.components.MilestoneEditorResult
 import dev.matejgroombridge.milestones.ui.components.MilestoneOverviewDialog
+import dev.matejgroombridge.milestones.ui.components.TargetReachedDialog
+import kotlinx.coroutines.launch
 
 /** Which dialog (if any) the milestones screen is currently showing. */
 private sealed interface HomeDialog {
     data object Create : HomeDialog
 
-    /** Log a new personal best — the primary action, opened by tapping a card. */
-    data class Log(val milestone: Milestone) : HomeDialog
+    /** Log an entry — a record's value, or a tally amount with a note. */
+    data class Log(val milestoneId: String) : HomeDialog
 
     /** Read-only snapshot of stats and history — opened by long-pressing a card. */
-    data class Overview(val milestone: Milestone) : HomeDialog
+    data class Overview(val milestoneId: String) : HomeDialog
 
     /** Full editor — reachable from [Overview]'s edit button. */
-    data class Edit(val milestone: Milestone) : HomeDialog
+    data class Edit(val milestoneId: String) : HomeDialog
+
+    /** Celebration after clearing a target, offering the next one. */
+    data class TargetReached(
+        val milestoneId: String,
+        val target: MilestoneTarget,
+    ) : HomeDialog
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,6 +82,12 @@ fun HomeScreen(
     settingsViewModel: SettingsViewModel,
     onOpenSettings: () -> Unit,
     onOpenArchive: () -> Unit,
+    /**
+     * Owned by the shell rather than this screen so that Scaffold can lift the
+     * FAB clear of the snackbar. Two sibling Scaffolds can't coordinate, and
+     * the FAB was covering the Undo action.
+     */
+    snackbar: SnackbarHostState,
     contentPadding: PaddingValues = PaddingValues(),
     requestCreate: Boolean = false,
     onCreateDialogConsumed: () -> Unit = {},
@@ -70,6 +95,7 @@ fun HomeScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val settings by settingsViewModel.settings.collectAsStateWithLifecycle()
     var dialog by remember { mutableStateOf<HomeDialog?>(null) }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(requestCreate) {
         if (requestCreate) {
@@ -78,16 +104,44 @@ fun HomeScreen(
         }
     }
 
-    // Confetti is driven by the view model rather than by the dialog's own
-    // validation, so a value that loses a race and gets rejected by the
-    // repository never fires a celebration for a record that wasn't stored.
     var fireConfetti by remember { mutableStateOf(false) }
-    LaunchedEffect(settings.celebrateRecords) {
-        if (!settings.celebrateRecords) return@LaunchedEffect
-        viewModel.celebrations.collect {
-            // Toggle through to retrigger ConfettiOverlay's LaunchedEffect.
-            fireConfetti = false
-            fireConfetti = true
+
+    // Everything that follows a log lands on one channel, because a single
+    // tap can legitimately do all three: store an undoable entry, be worth
+    // confetti, and clear a target worth a celebration.
+    LaunchedEffect(settings.celebrateRecords, settings.zenMode) {
+        viewModel.logEvents.collect { event ->
+            if (!event.accepted) return@collect
+
+            if (settings.celebrateRecords && event.worthCelebrating) {
+                // Toggle through to retrigger ConfettiOverlay's LaunchedEffect.
+                fireConfetti = false
+                fireConfetti = true
+            }
+
+            // Zen mode shows no dialogs beyond logging, so a cleared target
+            // waits quietly on the card until Zen is switched off.
+            event.reachedTarget?.let { target ->
+                if (!settings.zenMode) {
+                    dialog = HomeDialog.TargetReached(event.milestoneId, target)
+                }
+            }
+
+            val label = event.undoLabel
+            val entryId = event.entryId
+            if (label != null && entryId != null) {
+                scope.launch {
+                    val result = snackbar.showSnackbar(
+                        message = label,
+                        actionLabel = "Undo",
+                        withDismissAction = false,
+                        duration = SnackbarDuration.Short,
+                    )
+                    if (result == SnackbarResult.ActionPerformed) {
+                        viewModel.deleteEntry(event.milestoneId, entryId)
+                    }
+                }
+            }
         }
     }
 
@@ -111,19 +165,21 @@ fun HomeScreen(
                     // stays so the user has a way to flip Zen back off.
                     showArchive = !settings.zenMode,
                 )
-                if (state.activeMilestones.isEmpty()) {
+                if (state.hasNoMilestones) {
                     EmptyState(
                         modifier = Modifier.fillMaxSize(),
                         message = "No milestones yet.\nTap + to set your first goal.",
                     )
                 } else {
                     MilestonesGrid(
-                        milestones = state.activeMilestones,
+                        yearly = state.yearly,
+                        lifetime = state.lifetime,
+                        showHeaders = state.showSectionHeaders,
                         bottomPadding = contentPadding.calculateBottomPadding() + 24.dp,
-                        onTap = { milestone -> dialog = HomeDialog.Log(milestone) },
+                        onTap = { stats -> onCardTap(stats, viewModel) { dialog = it } },
                         // No long-press → overview dialog while in Zen.
                         onLongPress = if (settings.zenMode) ({ _ -> })
-                        else ({ milestone -> dialog = HomeDialog.Overview(milestone) }),
+                        else ({ stats -> dialog = HomeDialog.Overview(stats.milestone.id) }),
                     )
                 }
             }
@@ -131,16 +187,20 @@ fun HomeScreen(
         }
     }
 
-    // Zen mode keeps exactly one dialog reachable — logging a record, which
+    // Zen mode keeps exactly one dialog reachable — logging an entry, which
     // is the whole point of a tap. Everything else is dropped.
     LaunchedEffect(settings.zenMode) {
         if (settings.zenMode && dialog !is HomeDialog.Log) dialog = null
     }
     if (settings.zenMode && dialog !is HomeDialog.Log) return
 
+    // Every branch re-reads its milestone from live state, so a dialog left
+    // open reflects changes made underneath it — and closes itself if the
+    // milestone is deleted or archived elsewhere.
     when (val d = dialog) {
         is HomeDialog.Create -> MilestoneEditorDialog(
             existing = null,
+            activeTarget = null,
             onDismiss = { dialog = null },
             onResult = { result ->
                 if (result is MilestoneEditorResult.Save) {
@@ -149,6 +209,8 @@ fun HomeScreen(
                         description = result.description,
                         iconKey = result.iconKey,
                         colorKey = result.colorKey,
+                        kind = result.kind,
+                        cadence = result.cadence,
                         unit = result.unit,
                         direction = result.direction,
                         target = result.target,
@@ -158,52 +220,100 @@ fun HomeScreen(
                 dialog = null
             },
         )
+
         is HomeDialog.Log -> {
-            // Source the latest version from state so the "record to beat"
-            // banner stays live if the record changes while the dialog is open.
-            val live = state.activeMilestones.firstOrNull { it.id == d.milestone.id } ?: d.milestone
-            LogRecordDialog(
-                milestone = live,
+            val live = state.statsFor(d.milestoneId)
+            if (live == null) dialog = null
+            else LogEntryDialog(
+                stats = live,
                 todayEpochDay = state.todayEpochDay,
                 onDismiss = { dialog = null },
                 onSave = { value, epochDay, note ->
-                    viewModel.logRecord(live.id, value, epochDay, note)
+                    viewModel.logEntry(live.milestone.id, value, epochDay, note)
                     dialog = null
                 },
             )
         }
+
         is HomeDialog.Overview -> {
-            val live = state.activeMilestones.firstOrNull { it.id == d.milestone.id } ?: d.milestone
-            MilestoneOverviewDialog(
-                milestone = live,
+            val live = state.statsFor(d.milestoneId)
+            if (live == null) dialog = null
+            else MilestoneOverviewDialog(
+                stats = live,
                 todayEpochDay = state.todayEpochDay,
                 onDismiss = { dialog = null },
-                onEdit = { dialog = HomeDialog.Edit(live) },
-                onDeleteRecord = { recordId -> viewModel.deleteRecord(live.id, recordId) },
+                onEdit = { dialog = HomeDialog.Edit(d.milestoneId) },
+                onAddEntry = { dialog = HomeDialog.Log(d.milestoneId) },
+                onDeleteEntry = { entryId -> viewModel.deleteEntry(d.milestoneId, entryId) },
             )
         }
-        is HomeDialog.Edit -> MilestoneEditorDialog(
-            existing = d.milestone,
-            onDismiss = { dialog = null },
-            onResult = { result ->
-                when (result) {
-                    is MilestoneEditorResult.Save -> viewModel.updateMilestone(
-                        milestoneId = d.milestone.id,
-                        name = result.name,
-                        description = result.description,
-                        iconKey = result.iconKey,
-                        colorKey = result.colorKey,
-                        unit = result.unit,
-                        direction = result.direction,
-                        target = result.target,
-                    )
-                    is MilestoneEditorResult.Archive ->
-                        viewModel.setArchived(d.milestone.id, result.archived)
-                }
-                dialog = null
-            },
-        )
+
+        is HomeDialog.Edit -> {
+            val live = state.statsFor(d.milestoneId)
+            if (live == null) dialog = null
+            else MilestoneEditorDialog(
+                existing = live.milestone,
+                activeTarget = live.activeTarget?.value,
+                onDismiss = { dialog = null },
+                onResult = { result ->
+                    when (result) {
+                        is MilestoneEditorResult.Save -> viewModel.updateMilestone(
+                            milestoneId = d.milestoneId,
+                            name = result.name,
+                            description = result.description,
+                            iconKey = result.iconKey,
+                            colorKey = result.colorKey,
+                            kind = result.kind,
+                            cadence = result.cadence,
+                            unit = result.unit,
+                            direction = result.direction,
+                            target = result.target,
+                        )
+                        is MilestoneEditorResult.Archive ->
+                            viewModel.setArchived(d.milestoneId, result.archived)
+                    }
+                    dialog = null
+                },
+            )
+        }
+
+        is HomeDialog.TargetReached -> {
+            val live = state.statsFor(d.milestoneId)
+            if (live == null) dialog = null
+            else TargetReachedDialog(
+                stats = live,
+                reachedTarget = d.target,
+                onDismiss = { dialog = null },
+                onSetTarget = { value ->
+                    viewModel.setTarget(d.milestoneId, value)
+                    dialog = null
+                },
+            )
+        }
+
         null -> Unit
+    }
+}
+
+/**
+ * A tap means different things per kind. Adding to a tally is a single,
+ * reversible act, so it happens immediately with an undo — that speed is most
+ * of why counting things in this app feels good. Setting a record needs a
+ * value and a judgement about whether it beats the best, so it opens the sheet.
+ */
+private fun onCardTap(
+    stats: MilestoneStats,
+    viewModel: HomeViewModel,
+    showDialog: (HomeDialog) -> Unit,
+) {
+    if (stats.kind == MilestoneKind.Tally) {
+        viewModel.quickAdd(
+            milestoneId = stats.milestone.id,
+            name = stats.milestone.name,
+            unit = stats.unit,
+        )
+    } else {
+        showDialog(HomeDialog.Log(stats.milestone.id))
     }
 }
 
@@ -224,7 +334,6 @@ private fun MilestonesHeader(
             .fillMaxWidth()
             .height(112.dp),
     ) {
-        // Action icons pinned to the top-right.
         Row(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -246,8 +355,6 @@ private fun MilestonesHeader(
                 )
             }
         }
-        // Headline aligned to the bottom-start so cards immediately below sit
-        // flush with the underline of the text.
         Text(
             text = "Milestones",
             style = MaterialTheme.typography.headlineMedium,
@@ -259,12 +366,23 @@ private fun MilestonesHeader(
     }
 }
 
+/**
+ * The grid, split into "This year" and "All time".
+ *
+ * Labelled sections rather than a segmented control: with a personal-scale
+ * list, seeing both groups at once is worth more than the tidiness of hiding
+ * one behind a tap. Headings only appear when both groups exist, so a user
+ * with only lifetime records never sees a header explaining a division that
+ * doesn't apply to them.
+ */
 @Composable
 private fun MilestonesGrid(
-    milestones: List<Milestone>,
-    bottomPadding: androidx.compose.ui.unit.Dp,
-    onTap: (Milestone) -> Unit,
-    onLongPress: (Milestone) -> Unit,
+    yearly: List<MilestoneStats>,
+    lifetime: List<MilestoneStats>,
+    showHeaders: Boolean,
+    bottomPadding: Dp,
+    onTap: (MilestoneStats) -> Unit,
+    onLongPress: (MilestoneStats) -> Unit,
 ) {
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
@@ -278,14 +396,39 @@ private fun MilestonesGrid(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        items(items = milestones, key = { it.id }) { milestone ->
-            MilestoneCard(
-                milestone = milestone,
-                onClick = { onTap(milestone) },
-                onLongClick = { onLongPress(milestone) },
-            )
+        listOf(
+            MilestoneCadence.Yearly to yearly,
+            MilestoneCadence.Lifetime to lifetime,
+        ).forEach { (cadence, group) ->
+            if (group.isEmpty()) return@forEach
+            if (showHeaders) {
+                item(
+                    key = "header-${cadence.name}",
+                    span = { GridItemSpan(maxLineSpan) },
+                ) {
+                    SectionHeader(cadence.sectionTitle)
+                }
+            }
+            items(items = group, key = { it.milestone.id }) { stats ->
+                MilestoneCard(
+                    stats = stats,
+                    onClick = { onTap(stats) },
+                    onLongClick = { onLongPress(stats) },
+                )
+            }
         }
     }
+}
+
+@Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text = text.uppercase(),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(start = 6.dp, top = 4.dp, bottom = 2.dp),
+    )
 }
 
 /** Shared empty state used by every list screen. */

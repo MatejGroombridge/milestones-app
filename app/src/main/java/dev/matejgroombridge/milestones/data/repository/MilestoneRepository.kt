@@ -7,8 +7,11 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
 import dev.matejgroombridge.milestones.data.model.MilestoneDirection
-import dev.matejgroombridge.milestones.data.model.MilestoneRecord
+import dev.matejgroombridge.milestones.data.model.MilestoneEntry
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.data.model.MilestoneTarget
 import dev.matejgroombridge.milestones.data.model.MilestoneUnit
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -19,13 +22,30 @@ import kotlinx.serialization.json.Json
 private val Context.milestonesDataStore: DataStore<Preferences> by preferencesDataStore(name = "milestones")
 
 /**
+ * What happened when an entry was logged.
+ *
+ * @param accepted      False only when a record milestone rejected a value
+ *                      that didn't beat its best. Tallies always accept.
+ * @param entry         The stored entry, so the caller can offer an undo.
+ * @param reachedTarget Non-null when this entry cleared the active target —
+ *                      the cue for the "set a new one" celebration.
+ */
+data class LogOutcome(
+    val accepted: Boolean,
+    val entry: MilestoneEntry? = null,
+    val reachedTarget: MilestoneTarget? = null,
+    /** The milestone's kind, so callers can tell a new best from a +1. */
+    val kind: MilestoneKind? = null,
+)
+
+/**
  * Single source of truth for the user's milestones. Backed by a Preferences
  * DataStore that stores the whole list as a JSON-encoded string under one key.
  *
  * For a personal-scale tracker this is intentionally simple — no Room, no
- * migrations, just one JSON blob. Adding new fields to [Milestone] is safe
- * because the parser is configured with `ignoreUnknownKeys = true` and every
- * new field has a default value.
+ * migrations table, just one JSON blob. Schema changes stay safe because the
+ * parser ignores unknown keys, every field has a default, and [Milestone.migrated]
+ * folds legacy shapes forward on load.
  */
 class MilestoneRepository(private val context: Context) {
 
@@ -44,8 +64,8 @@ class MilestoneRepository(private val context: Context) {
 
     /**
      * Creates a new milestone. When [startingValue] is non-null it's logged
-     * immediately as the first record, so a user who already knows their
-     * current best doesn't have to create-then-log in two steps.
+     * immediately as the first entry, so a user who already knows their
+     * current best (or count) doesn't have to create-then-log in two steps.
      */
     suspend fun addMilestone(
         name: String,
@@ -53,6 +73,8 @@ class MilestoneRepository(private val context: Context) {
         description: String = "",
         iconKey: String = Milestone.DEFAULT_ICON_KEY,
         colorKey: String = Milestone.DEFAULT_COLOR_KEY,
+        kind: MilestoneKind = MilestoneKind.Default,
+        cadence: MilestoneCadence = MilestoneCadence.Default,
         unit: MilestoneUnit = MilestoneUnit.Default,
         direction: MilestoneDirection = MilestoneDirection.Default,
         target: Double? = null,
@@ -61,31 +83,43 @@ class MilestoneRepository(private val context: Context) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
         update { current ->
-            current + Milestone(
+            val created = Milestone(
                 name = trimmed,
                 description = description.trim(),
                 iconKey = iconKey,
                 colorKey = colorKey,
+                kind = kind,
+                cadence = cadence,
                 unit = unit,
-                direction = direction,
-                target = target,
+                // A tally only ever climbs, so its direction is fixed rather
+                // than left to whatever the editor happened to be showing.
+                direction = if (kind == MilestoneKind.Tally) {
+                    MilestoneDirection.HigherIsBetter
+                } else direction,
                 createdAtEpochDay = todayEpochDay,
-                records = startingValue?.let {
-                    listOf(MilestoneRecord(value = it, epochDay = todayEpochDay))
+                entries = startingValue?.let {
+                    listOf(MilestoneEntry(value = it, epochDay = todayEpochDay))
                 } ?: emptyList(),
             )
+            current + created
+                .withTarget(target, todayEpochDay)
+                .settleTargets(todayEpochDay)
         }
     }
 
     /**
-     * Replaces the editable fields on an existing milestone. Record history
-     * and id are preserved.
+     * Replaces the editable fields on an existing milestone. Entry history is
+     * preserved.
      *
      * Changing [unit] does *not* convert stored values — the numbers stay put
      * and only their presentation changes. Switching a "km" milestone to
-     * "miles" therefore relabels rather than recalculates, which is the
-     * honest behaviour: the app has no idea whether the user meant to
-     * reinterpret old readings or correct a mislabelled one.
+     * miles therefore relabels rather than recalculates, which is the honest
+     * behaviour: the app has no idea whether the user meant to reinterpret
+     * old readings or fix a mislabelled one.
+     *
+     * Changing [kind] or [cadence] likewise leaves entries alone, but does
+     * re-settle targets — flipping a milestone to Yearly moves the goalposts
+     * to this year's numbers, which can legitimately reopen a cleared target.
      */
     suspend fun updateMilestone(
         milestoneId: String,
@@ -93,70 +127,105 @@ class MilestoneRepository(private val context: Context) {
         description: String,
         iconKey: String,
         colorKey: String,
+        kind: MilestoneKind,
+        cadence: MilestoneCadence,
         unit: MilestoneUnit,
         direction: MilestoneDirection,
         target: Double?,
+        todayEpochDay: Long,
     ) {
         val trimmedName = name.trim()
         if (trimmedName.isEmpty()) return
         update { current ->
             current.map { m ->
-                if (m.id == milestoneId) {
-                    m.copy(
-                        name = trimmedName,
-                        description = description.trim(),
-                        iconKey = iconKey,
-                        colorKey = colorKey,
-                        unit = unit,
-                        direction = direction,
-                        target = target,
-                    )
-                } else m
+                if (m.id != milestoneId) m
+                else m.copy(
+                    name = trimmedName,
+                    description = description.trim(),
+                    iconKey = iconKey,
+                    colorKey = colorKey,
+                    kind = kind,
+                    cadence = cadence,
+                    unit = unit,
+                    direction = if (kind == MilestoneKind.Tally) {
+                        MilestoneDirection.HigherIsBetter
+                    } else direction,
+                ).withTarget(target, todayEpochDay).settleTargets(todayEpochDay)
             }
         }
     }
 
     /**
-     * Logs [value] against [milestoneId] if — and only if — it beats the
-     * current best. Returns `true` when a new record was stored.
+     * Logs [value] against [milestoneId].
      *
-     * The check happens here rather than only in the dialog so the
-     * strictly-improving invariant holds no matter which entry point calls
-     * in, and so two rapid saves can't both slip past a stale UI check.
+     * A record only accepts a value that beats its current best; a tally
+     * accepts everything. The check lives here rather than only in the dialog
+     * so the invariant holds no matter which entry point calls in, and so two
+     * rapid saves can't both slip past a stale UI check.
      */
-    suspend fun logRecord(
+    suspend fun logEntry(
         milestoneId: String,
         value: Double,
         epochDay: Long,
         note: String = "",
-    ): Boolean {
-        var accepted = false
+        todayEpochDay: Long,
+    ): LogOutcome {
+        var outcome = LogOutcome(accepted = false)
         update { current ->
             // DataStore may re-run this transform if another write lands
-            // first, so the flag is reset per attempt rather than latched.
-            accepted = false
+            // first, so the outcome is reset per attempt rather than latched.
+            outcome = LogOutcome(accepted = false)
             current.map { m ->
-                if (m.id != milestoneId || !m.beats(value)) m
-                else {
-                    accepted = true
-                    m.withRecord(
-                        MilestoneRecord(value = value, epochDay = epochDay, note = note.trim()),
-                    )
-                }
+                if (m.id != milestoneId || !m.accepts(value, todayEpochDay)) return@map m
+
+                val entry = MilestoneEntry(value = value, epochDay = epochDay, note = note.trim())
+                val periodKey = m.currentPeriodKey(todayEpochDay)
+                val before = m.activeTargetIn(periodKey)
+                val after = m.withEntry(entry).settleTargets(todayEpochDay)
+                // A target counts as "just reached" only if it was the one
+                // being chased a moment ago and is now stamped — so a
+                // back-dated entry that lands in a closed period can't fire
+                // a celebration for a goal that was already done.
+                val reached = before
+                    ?.let { active -> after.targets.firstOrNull { it.id == active.id } }
+                    ?.takeIf { it.isReached }
+
+                outcome = LogOutcome(
+                    accepted = true,
+                    entry = entry,
+                    reachedTarget = reached,
+                    kind = m.kind,
+                )
+                after
             }
         }
-        return accepted
+        return outcome
     }
 
     /**
-     * Removes a single record — the escape hatch for a mistyped value.
+     * Removes a single entry — the escape hatch for a mistyped value.
      *
-     * Deleting the current best promotes the previous one back to the top,
-     * which is exactly what you want after fat-fingering an unbeatable number.
+     * Deleting a record's current best promotes the previous one back to the
+     * top, which is exactly what's needed after fat-fingering an unbeatable
+     * number. Targets are re-settled afterwards, so a goal that was only
+     * cleared by the deleted entry reopens.
      */
-    suspend fun deleteRecord(milestoneId: String, recordId: String) {
+    suspend fun deleteEntry(milestoneId: String, entryId: String, todayEpochDay: Long) {
         update { current ->
-            current.map { m -> if (m.id == milestoneId) m.withoutRecord(recordId) else m }
+            current.map { m ->
+                if (m.id == milestoneId) m.withoutEntry(entryId).settleTargets(todayEpochDay) else m
+            }
+        }
+    }
+
+    /** Sets (or with `null`, clears) the target for the current period. */
+    suspend fun setTarget(milestoneId: String, value: Double?, todayEpochDay: Long) {
+        update { current ->
+            current.map { m ->
+                if (m.id == milestoneId) {
+                    m.withTarget(value, todayEpochDay).settleTargets(todayEpochDay)
+                } else m
+            }
         }
     }
 
@@ -173,8 +242,7 @@ class MilestoneRepository(private val context: Context) {
     /**
      * Reorder the active (non-archived) milestones to match [orderedActiveIds].
      * Archived milestones keep their relative order and are appended after the
-     * reordered active ones, mirroring how the main grid filters them out
-     * anyway.
+     * reordered active ones, mirroring how the grid filters them out anyway.
      *
      * IDs that don't correspond to a current milestone are silently ignored,
      * and any active milestone missing from the list is appended in its
@@ -199,20 +267,20 @@ class MilestoneRepository(private val context: Context) {
      */
     suspend fun exportJson(): String {
         val prefs = context.milestonesDataStore.data.first()
-        val current = load(prefs[KEY_MILESTONES_JSON])
-        return json.encodeToString(listSerializer, current)
+        return json.encodeToString(listSerializer, load(prefs[KEY_MILESTONES_JSON]))
     }
 
     /**
      * Replace the milestone list with the contents of [rawJson]. Returns the
-     * number of milestones imported, or `null` if the JSON couldn't be parsed
-     * (the existing list is left untouched in that case).
+     * number imported, or `null` if the JSON couldn't be parsed (the existing
+     * list is left untouched in that case).
      */
     suspend fun importJson(rawJson: String): Int? {
         val parsed = runCatching { json.decodeFromString(listSerializer, rawJson) }.getOrNull()
             ?: return null
-        update { parsed }
-        return parsed.size
+        val migrated = parsed.map { it.migrated() }
+        update { migrated }
+        return migrated.size
     }
 
     private suspend fun update(block: (List<Milestone>) -> List<Milestone>) {
@@ -227,6 +295,9 @@ class MilestoneRepository(private val context: Context) {
         if (raw.isNullOrBlank()) return emptyList()
         return runCatching { json.decodeFromString(listSerializer, raw) }
             .getOrDefault(emptyList())
+            // Fold v0.1.0's single `target` field forward on the way out, so
+            // nothing downstream has to know the old shape ever existed.
+            .map { it.migrated() }
     }
 
     private companion object {

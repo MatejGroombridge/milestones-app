@@ -1,35 +1,44 @@
 package dev.matejgroombridge.milestones.data.model
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.util.UUID
-import kotlin.math.abs
 
 /**
- * A single goal the user is chasing a personal best on — books read, longest
- * run, fastest 5km, best month of revenue.
+ * A goal the user is chasing — a personal best to beat, or a count to run up,
+ * scored either for life or for the current year.
+ *
+ * Two axes describe every milestone:
+ *  - [kind] — is this the *best* of many attempts, or the *sum* of events?
+ *  - [cadence] — does it run forever, or reset each year?
+ *
+ * That 2×2 is what separates "my furthest run" from "books read this year",
+ * and it's why almost every derived figure here is computed *for a period*
+ * rather than over the whole list. See [statsOn], which is the single place
+ * those four combinations are resolved.
  *
  * Schema notes:
  *  - The repository decodes JSON with `ignoreUnknownKeys = true` and every
- *    field below has a default, so adding new fields later stays backwards
- *    compatible.
- *  - [records] is the source of truth. Everything else on this class — the
- *    current best, how much you improved by, progress toward a target — is
- *    derived from it, so there's no denormalised "currentValue" to keep in
- *    sync.
+ *    field has a default, so adding fields later stays backwards compatible.
+ *  - [entries] keeps the wire name `records` from the first release, and
+ *    [legacyTarget] is folded into [targets] by [migrated] on load, so v0.1.0
+ *    data opens unchanged.
+ *  - [entries] and [targets] are the source of truth. Nothing denormalised is
+ *    stored, so there's no cached "current value" to fall out of sync.
  *
  * @param id                Stable identifier. Generated once on creation.
  * @param name              User-supplied name (e.g. "Fastest 5km").
  * @param description       Optional free-text description.
- * @param iconKey           Key into `MilestoneIcons.catalog`. Falls back to default if unknown.
- * @param colorKey          Key into `MilestoneColors.palette`. Falls back to first colour if unknown.
+ * @param iconKey           Key into `MilestoneIcons.catalog`. Unknown keys fall back.
+ * @param colorKey          Key into `MilestoneColors.palette`. Unknown keys fall back.
+ * @param kind              Best-of-attempts, or a running count.
+ * @param cadence           Scored for life, or per calendar year.
  * @param unit              How values are entered and displayed.
- * @param direction         Whether bigger or smaller numbers are the better result.
- * @param target            Optional value the user is aiming for. Drives the
- *                          progress bar on the card; `null` = open-ended.
- * @param archived          When true, hidden from the main grid and shown only
- *                          on the Archived screen.
- * @param createdAtEpochDay The day the milestone was created, as `LocalDate.toEpochDay()`.
- * @param records           Chronological chain of personal bests, oldest first.
+ * @param direction         Which way a record improves. Ignored for tallies.
+ * @param archived          Hidden from the grid, shown only on the Archived screen.
+ * @param createdAtEpochDay The day the milestone was created.
+ * @param entries           Everything logged, in insertion order.
+ * @param targets           Targets set against this milestone, active and cleared.
  */
 @Serializable
 data class Milestone(
@@ -38,143 +47,169 @@ data class Milestone(
     val description: String = "",
     val iconKey: String = DEFAULT_ICON_KEY,
     val colorKey: String = DEFAULT_COLOR_KEY,
+    val kind: MilestoneKind = MilestoneKind.Default,
+    val cadence: MilestoneCadence = MilestoneCadence.Default,
     val unit: MilestoneUnit = MilestoneUnit.Default,
     val direction: MilestoneDirection = MilestoneDirection.Default,
-    val target: Double? = null,
     val archived: Boolean = false,
     val createdAtEpochDay: Long,
-    val records: List<MilestoneRecord> = emptyList(),
+    @SerialName("records")
+    val entries: List<MilestoneEntry> = emptyList(),
+    val targets: List<MilestoneTarget> = emptyList(),
+    /**
+     * v0.1.0 stored a single `target: Double?`. Kept only so that JSON still
+     * parses; [migrated] converts it into a [MilestoneTarget] and clears it.
+     * Never read anywhere else — use [targets].
+     */
+    @SerialName("target")
+    val legacyTarget: Double? = null,
 ) {
 
-    /** Whether anything has been logged yet. */
-    val hasRecord: Boolean get() = records.isNotEmpty()
+    /** Entries in the order they happened. */
+    val entriesByDate: List<MilestoneEntry> get() = entries.sortedBy { it.epochDay }
+
+    /** Whether anything has been logged at all. */
+    val hasEntries: Boolean get() = entries.isNotEmpty()
 
     /**
-     * The current personal best.
+     * Folds the v0.1.0 [legacyTarget] into [targets] so the rest of the app
+     * only ever deals with the modern shape.
      *
-     * Derived with a max/min rather than "last element" so an imported or
-     * hand-edited JSON blob with an out-of-order list still reports the right
-     * answer instead of quietly showing a worse value as the record.
+     * Idempotent — once [legacyTarget] is null this returns `this`, so calling
+     * it on every load is free after the first save.
      */
-    val best: MilestoneRecord?
-        get() = when (direction) {
-            MilestoneDirection.HigherIsBetter -> records.maxByOrNull { it.value }
-            MilestoneDirection.LowerIsBetter -> records.minByOrNull { it.value }
-        }
-
-    /** The best value, or `null` when nothing has been logged. */
-    val bestValue: Double? get() = best?.value
-
-    /** The record that [best] beat — i.e. the second-best entry. */
-    val previousBest: MilestoneRecord?
-        get() {
-            val current = best ?: return null
-            val rest = records.filterNot { it.id == current.id }
-            return when (direction) {
-                MilestoneDirection.HigherIsBetter -> rest.maxByOrNull { it.value }
-                MilestoneDirection.LowerIsBetter -> rest.minByOrNull { it.value }
-            }
-        }
-
-    /** Records ordered for charting: oldest day first, ties broken by list order. */
-    val recordsByDate: List<MilestoneRecord> get() = records.sortedBy { it.epochDay }
-
-    /** Whether [value] would be a new personal best. */
-    fun beats(value: Double): Boolean = direction.isBetter(value, bestValue)
-
-    /**
-     * How much the latest record improved on the one before it, as a positive
-     * magnitude. `null` when there's nothing to compare against.
-     */
-    val lastImprovement: Double?
-        get() {
-            val current = bestValue ?: return null
-            val previous = previousBest?.value ?: return null
-            return abs(current - previous)
-        }
-
-    /**
-     * Total distance travelled from the first record to the best one, as a
-     * positive magnitude. This is the headline "how far have I come?" number.
-     */
-    val totalImprovement: Double?
-        get() {
-            if (records.size < 2) return null
-            val first = recordsByDate.first().value
-            val current = bestValue ?: return null
-            return abs(current - first)
-        }
-
-    /**
-     * Progress toward [target] in `0f..1f`, or `null` when no target is set.
-     *
-     * For "higher is better" the run is measured from the first record (or
-     * from zero when there's only one) up to the target. For "lower is
-     * better" it's measured downward from the starting point toward the
-     * target, so a 30:00 → 25:00 journey against a 24:00 goal reads as most
-     * of the way there rather than as a number over 100%.
-     */
-    val targetProgress: Float?
-        get() {
-            val goal = target ?: return null
-            val current = bestValue ?: return 0f
-            val start = recordsByDate.firstOrNull()?.value ?: current
-            return when (direction) {
-                MilestoneDirection.HigherIsBetter -> {
-                    // Counting up from zero reads more naturally than counting
-                    // from the first record, which would show a brand-new
-                    // milestone at 0% forever until it improved once.
-                    if (goal <= 0.0) 1f else (current / goal).toFloat().coerceIn(0f, 1f)
-                }
-                MilestoneDirection.LowerIsBetter -> {
-                    val span = start - goal
-                    if (span <= 0.0) 1f else ((start - current) / span).toFloat().coerceIn(0f, 1f)
-                }
-            }
-        }
-
-    /** Whether the target has been met or beaten. */
-    val targetReached: Boolean
-        get() {
-            val goal = target ?: return false
-            val current = bestValue ?: return false
-            return when (direction) {
-                MilestoneDirection.HigherIsBetter -> current >= goal
-                MilestoneDirection.LowerIsBetter -> current <= goal
-            }
-        }
-
-    /** How far the best still is from [target], as a positive magnitude. */
-    val remainingToTarget: Double?
-        get() {
-            val goal = target ?: return null
-            val current = bestValue ?: return goal
-            if (targetReached) return 0.0
-            return abs(goal - current)
-        }
-
-    /** Days since the last record was set, or `null` when nothing is logged. */
-    fun daysSinceLastRecord(todayEpochDay: Long): Long? {
-        val latest = records.maxByOrNull { it.epochDay } ?: return null
-        return (todayEpochDay - latest.epochDay).coerceAtLeast(0L)
+    fun migrated(): Milestone {
+        val legacy = legacyTarget ?: return this
+        // A legacy target was always lifetime-scoped (v0.1.0 had no cadence)
+        // and never carried a "reached" stamp, so it becomes an active target
+        // with the milestone's creation day as its start.
+        val converted = MilestoneTarget(
+            value = legacy,
+            setOnEpochDay = createdAtEpochDay,
+            periodKey = null,
+        )
+        return copy(
+            targets = if (targets.isEmpty()) listOf(converted) else targets,
+            legacyTarget = null,
+        )
     }
 
-    /** The best value already formatted for display, or a placeholder dash. */
-    val formattedBest: String get() = bestValue?.let(unit::format) ?: "—"
+    // --- Period-scoped reads -------------------------------------------------
 
-    /** [target] formatted for display, or `null` when open-ended. */
-    val formattedTarget: String? get() = target?.let(unit::format)
+    /** The period [todayEpochDay] falls into: the year, or null for lifetime. */
+    fun currentPeriodKey(todayEpochDay: Long): Int? = cadence.periodKeyFor(todayEpochDay)
+
+    /** Entries belonging to [periodKey], oldest first. */
+    fun entriesIn(periodKey: Int?): List<MilestoneEntry> =
+        entriesByDate.filter { cadence.contains(it.epochDay, periodKey) }
 
     /**
-     * Adds [record] and returns the updated milestone. Callers are expected to
-     * have checked [beats] first — the repository does, which is what keeps
-     * [records] a strictly-improving chain.
+     * The headline number for [entriesInPeriod] — best-of for a record, sum
+     * for a tally.
+     *
+     * Records return `null` when there's nothing logged (the UI shows a dash);
+     * tallies return `0.0`, because "no books yet" genuinely is zero books.
      */
-    fun withRecord(record: MilestoneRecord): Milestone = copy(records = records + record)
+    fun valueOf(entriesInPeriod: List<MilestoneEntry>): Double? = when (kind) {
+        MilestoneKind.Tally -> entriesInPeriod.sumOf { it.value }
+        MilestoneKind.Record -> bestOf(entriesInPeriod)?.value
+    }
 
-    /** Removes the record with [recordId], if present. */
-    fun withoutRecord(recordId: String): Milestone =
-        copy(records = records.filterNot { it.id == recordId })
+    /** The winning entry among [candidates], per [direction]. Records only. */
+    fun bestOf(candidates: List<MilestoneEntry>): MilestoneEntry? = when (direction) {
+        MilestoneDirection.HigherIsBetter -> candidates.maxByOrNull { it.value }
+        MilestoneDirection.LowerIsBetter -> candidates.minByOrNull { it.value }
+    }
+
+    /**
+     * Whether [value] would be stored if logged on [todayEpochDay].
+     *
+     * Tallies accept anything — every event counts. Records only accept a
+     * value that beats the current period's best, which is what keeps their
+     * history strictly improving. Note the comparison is against the
+     * *period's* best, so a yearly record milestone starts fresh each January
+     * rather than being locked behind an all-time peak.
+     */
+    fun accepts(value: Double, todayEpochDay: Long): Boolean {
+        if (kind == MilestoneKind.Tally) return true
+        val periodBest = valueOf(entriesIn(currentPeriodKey(todayEpochDay)))
+        return direction.isBetter(value, periodBest)
+    }
+
+    // --- Targets -------------------------------------------------------------
+
+    /** Targets belonging to [periodKey]. */
+    fun targetsIn(periodKey: Int?): List<MilestoneTarget> =
+        targets.filter { it.periodKey == periodKey }
+
+    /** The target currently being chased in [periodKey], if any. */
+    fun activeTargetIn(periodKey: Int?): MilestoneTarget? =
+        targetsIn(periodKey).lastOrNull { !it.isReached }
+
+    /** The most recently cleared target in [periodKey], if any. */
+    fun lastReachedTargetIn(periodKey: Int?): MilestoneTarget? =
+        targetsIn(periodKey).filter { it.isReached }.maxByOrNull { it.reachedOnEpochDay ?: 0L }
+
+    /**
+     * Brings the current period's targets in line with what's actually been
+     * logged: stamps one that's now been met, and un-stamps one that no longer
+     * is (which happens when the user deletes the entry that cleared it).
+     *
+     * Deliberately scoped to the current period. Reconciling every target
+     * would let a rollover un-stamp goals the user genuinely hit in past
+     * years, and history shouldn't rewrite itself.
+     */
+    fun settleTargets(todayEpochDay: Long): Milestone {
+        val periodKey = currentPeriodKey(todayEpochDay)
+        val current = valueOf(entriesIn(periodKey))
+        var changed = false
+        val settled = targets.map { target ->
+            if (target.periodKey != periodKey) return@map target
+            val met = target.isMetBy(current, kind, direction)
+            when {
+                met && !target.isReached -> {
+                    changed = true
+                    target.copy(reachedOnEpochDay = todayEpochDay)
+                }
+                !met && target.isReached -> {
+                    changed = true
+                    target.copy(reachedOnEpochDay = null)
+                }
+                else -> target
+            }
+        }
+        return if (changed) copy(targets = settled) else this
+    }
+
+    /**
+     * Sets [value] as the target for the current period, replacing the active
+     * one if there is one. Passing `null` clears it.
+     */
+    fun withTarget(value: Double?, todayEpochDay: Long): Milestone {
+        val periodKey = currentPeriodKey(todayEpochDay)
+        val active = activeTargetIn(periodKey)
+        val next = when {
+            value == null -> targets.filterNot { it.id == active?.id }
+            active != null -> targets.map {
+                if (it.id == active.id) it.copy(value = value, setOnEpochDay = todayEpochDay) else it
+            }
+            else -> targets + MilestoneTarget(
+                value = value,
+                setOnEpochDay = todayEpochDay,
+                periodKey = periodKey,
+            )
+        }
+        return copy(targets = next)
+    }
+
+    // --- Mutations -----------------------------------------------------------
+
+    /** Adds [entry]. Callers check [accepts] first; the repository does. */
+    fun withEntry(entry: MilestoneEntry): Milestone = copy(entries = entries + entry)
+
+    /** Removes the entry with [entryId], if present. */
+    fun withoutEntry(entryId: String): Milestone =
+        copy(entries = entries.filterNot { it.id == entryId })
 
     companion object {
         const val DEFAULT_ICON_KEY = "trophy"

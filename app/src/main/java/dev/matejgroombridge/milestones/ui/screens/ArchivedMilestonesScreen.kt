@@ -42,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
 import dev.matejgroombridge.milestones.ui.HomeViewModel
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
@@ -114,7 +115,7 @@ fun ArchivedMilestonesScreen(
             text = {
                 Text(
                     "\"${milestone.name}\" will be permanently removed along with " +
-                        "all ${milestone.records.size} of its records.",
+                        "all ${milestone.entries.size} of its entries.",
                 )
             },
             confirmButton = {
@@ -171,8 +172,15 @@ private fun ArchivedRow(
                     color = color.contentColor(),
                 )
                 Text(
-                    text = if (milestone.hasRecord) "Best ${milestone.formattedBest}"
-                    else "No records",
+                    // Archived milestones are shown at their all-time figure
+                    // rather than the current period's — a shelved yearly goal
+                    // reading "0 this year" would say nothing about what it was.
+                    text = milestone.valueOf(milestone.entriesByDate)
+                        ?.takeIf { milestone.hasEntries }
+                        ?.let { value ->
+                            val figure = milestone.unit.format(value)
+                            if (milestone.kind == MilestoneKind.Tally) figure else "Best $figure"
+                        } ?: "Nothing logged",
                     style = MaterialTheme.typography.bodySmall,
                     color = color.contentColor().copy(alpha = 0.7f),
                     maxLines = 1,

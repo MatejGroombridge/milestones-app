@@ -20,6 +20,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -179,6 +181,12 @@ private fun MainPager(
     val haptics = rememberHaptics()
     val settings by settingsViewModel.settings.collectAsStateWithLifecycle()
 
+    // The snackbar lives here rather than inside HomeScreen so that this
+    // Scaffold owns both it and the FAB, and can lift the FAB clear when one
+    // shows. Sibling Scaffolds can't do that, and the FAB ended up sitting on
+    // top of the Undo action.
+    val snackbar = remember { SnackbarHostState() }
+
     // Light buzz whenever the pager actually settles on a new page (whether
     // initiated by a swipe or a tab tap). We snapshot the previous page so the
     // initial composition (page == initialPage) doesn't fire a buzz.
@@ -204,6 +212,7 @@ private fun MainPager(
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
+        snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             // Zen mode hides the bottom navigation completely — there's
             // nothing to navigate to, only Milestones exists.
@@ -269,6 +278,7 @@ private fun MainPager(
                     settingsViewModel = settingsViewModel,
                     onOpenSettings = onOpenSettings,
                     onOpenArchive = onOpenArchive,
+                    snackbar = snackbar,
                     contentPadding = padding,
                     requestCreate = requestCreate,
                     onCreateDialogConsumed = { requestCreate = false },

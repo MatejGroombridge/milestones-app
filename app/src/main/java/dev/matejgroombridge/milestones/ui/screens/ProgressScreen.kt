@@ -2,6 +2,7 @@ package dev.matejgroombridge.milestones.ui.screens
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.EmojiEvents
@@ -45,7 +47,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.data.model.MilestoneStats
+import dev.matejgroombridge.milestones.data.model.yearOf
 import dev.matejgroombridge.milestones.ui.HomeViewModel
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
@@ -53,13 +58,23 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
 /**
- * Per-milestone progression. Each row shows the milestone's headline stats
- * followed by a chart of every record plotted against the day it was set,
- * with the target (if any) as a dashed line to aim at.
+ * Per-milestone progression, plotted against real dates.
  *
- * Plotting against real dates — rather than by index as the overview
- * sparkline does — is the point of this screen: it's where a long plateau
- * between two records actually shows up as a long flat stretch.
+ * Dates rather than entry index is the point of this screen: it's where a long
+ * plateau between two records actually looks like a long flat stretch, and
+ * where a yearly goal's pace against the calendar becomes visible. The
+ * overview dialog's sparkline covers the "shape of the journey" glance.
+ *
+ * What gets drawn depends on the milestone:
+ *  - **Tally** — the running total climbing from zero, so the line shows
+ *    accumulation rather than a row of identical `+1`s.
+ *  - **Record** — the values themselves.
+ *  - **Yearly** — the x-axis spans the calendar year, so how far through it
+ *    you are is legible at a glance, with past years summarised beneath.
+ *  - **Lifetime** — the x-axis spans first entry to today.
+ *
+ * Targets overlay as dashed lines: the active one in full accent, cleared ones
+ * faded, which turns the goal history into a picture of how far it has come.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -80,7 +95,7 @@ fun ProgressScreen(
             )
         },
     ) { padding ->
-        if (state.activeMilestones.isEmpty()) {
+        if (state.hasNoMilestones) {
             EmptyState(
                 modifier = Modifier.padding(padding),
                 message = "No milestones yet.\nAdd one on the Milestones tab.",
@@ -98,25 +113,33 @@ fun ProgressScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
-            items(items = state.activeMilestones, key = { it.id }) { milestone ->
-                ProgressRow(milestone = milestone, today = state.todayEpochDay)
+            items(items = state.activeStats, key = { it.milestone.id }) { stats ->
+                ProgressRow(stats = stats, today = state.todayEpochDay)
             }
         }
     }
 }
 
+/** A point on the chart: when, and what the line was worth then. */
+private data class Plot(val epochDay: Long, val value: Double)
+
 @Composable
-private fun ProgressRow(milestone: Milestone, today: Long) {
+private fun ProgressRow(stats: MilestoneStats, today: Long) {
+    val milestone = stats.milestone
     val color = MilestoneColors.entry(milestone.colorKey)
     val iconEntry = MilestoneIcons.entry(milestone.iconKey)
-    val chain = remember(milestone.records) { milestone.recordsByDate }
+    val isTally = stats.kind == MilestoneKind.Tally
 
     val contentColor = MaterialTheme.colorScheme.onBackground
     val mutedColor = MaterialTheme.colorScheme.onSurfaceVariant
 
+    // The window the chart spans. A yearly milestone always shows the whole
+    // calendar year so "how far through am I?" is answerable; a lifetime one
+    // spans from its first entry to now.
+    val range = remember(stats, today) { chartRange(stats, today) }
+    val plots = remember(stats, range) { plotsFor(stats, range.first) }
+
     Column(modifier = Modifier.fillMaxWidth()) {
-        // Header sits inside the standard horizontal padding so it lines up
-        // with the rest of the app.
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(horizontal = 20.dp),
@@ -149,13 +172,13 @@ private fun ProgressRow(milestone: Milestone, today: Long) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Outlined.EmojiEvents,
-                        contentDescription = "Personal best",
+                        contentDescription = if (isTally) "Total" else "Personal best",
                         tint = color.accent,
                         modifier = Modifier.size(14.dp),
                     )
                     Spacer(Modifier.width(3.dp))
                     Text(
-                        text = milestone.formattedBest,
+                        text = stats.formattedValue,
                         style = MaterialTheme.typography.bodySmall,
                         color = mutedColor,
                         maxLines = 1,
@@ -163,13 +186,13 @@ private fun ProgressRow(milestone: Milestone, today: Long) {
                     Spacer(Modifier.width(10.dp))
                     Icon(
                         imageVector = Icons.Outlined.Timeline,
-                        contentDescription = "Records set",
+                        contentDescription = "Entries",
                         tint = color.accent,
                         modifier = Modifier.size(14.dp),
                     )
                     Spacer(Modifier.width(3.dp))
                     Text(
-                        text = milestone.records.size.toString(),
+                        text = stats.periodEntryCount.toString(),
                         style = MaterialTheme.typography.bodySmall,
                         color = mutedColor,
                     )
@@ -179,17 +202,18 @@ private fun ProgressRow(milestone: Milestone, today: Long) {
 
         Spacer(Modifier.height(12.dp))
 
-        if (chain.isEmpty()) {
+        if (plots.isEmpty()) {
             Text(
-                text = "No records yet — tap the card on the Milestones tab to log one.",
+                text = "Nothing logged yet — tap the card on the Milestones tab.",
                 style = MaterialTheme.typography.bodySmall,
                 color = mutedColor,
                 modifier = Modifier.padding(horizontal = 20.dp),
             )
         } else {
             ProgressChart(
-                milestone = milestone,
-                today = today,
+                stats = stats,
+                plots = plots,
+                range = range,
                 accent = color.accent,
                 gridColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                 modifier = Modifier
@@ -206,45 +230,78 @@ private fun ProgressRow(milestone: Milestone, today: Long) {
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Text(
-                    text = LocalDate.ofEpochDay(chain.first().epochDay).format(AXIS_DATE_FORMAT),
+                    text = LocalDate.ofEpochDay(range.first).format(AXIS_DATE_FORMAT),
                     style = MaterialTheme.typography.labelSmall,
                     color = mutedColor,
                 )
-                milestone.formattedTarget?.let { target ->
+                stats.formattedTarget?.let { target ->
                     Text(
-                        text = if (milestone.targetReached) "Target $target reached"
-                        else "Target $target",
+                        text = "Target $target",
                         style = MaterialTheme.typography.labelSmall,
                         color = mutedColor,
                     )
                 }
                 Text(
-                    text = "Today",
+                    text = if (stats.cadence == MilestoneCadence.Yearly) {
+                        LocalDate.ofEpochDay(range.second).format(AXIS_DATE_FORMAT)
+                    } else "Today",
                     style = MaterialTheme.typography.labelSmall,
                     color = mutedColor,
                 )
             }
         }
+
+        if (stats.cadence == MilestoneCadence.Yearly) {
+            PastYears(stats = stats, today = today, mutedColor = mutedColor)
+        }
     }
 }
 
+/** Inclusive epoch-day window the chart covers. */
+private fun chartRange(stats: MilestoneStats, today: Long): Pair<Long, Long> {
+    if (stats.cadence == MilestoneCadence.Yearly) {
+        val year = yearOf(today)
+        return LocalDate.of(year, 1, 1).toEpochDay() to LocalDate.of(year, 12, 31).toEpochDay()
+    }
+    val first = stats.periodEntries.firstOrNull()?.epochDay ?: today
+    val last = stats.periodEntries.lastOrNull()?.epochDay ?: today
+    return first to maxOf(today, last)
+}
+
 /**
- * Line chart of the record chain against real dates.
+ * The points to draw.
  *
- * The y-axis range spans every record *and* the target, so an unmet goal is
- * always visible on the chart rather than sitting off the top edge. A flat
- * run — one record, or several identical values — has no range to scale
- * against and is drawn on the midline.
+ * A tally becomes its running total and gains a zero point at the start of the
+ * window, so the line climbs from the floor rather than starting mid-air at
+ * whatever the first entry happened to be worth.
  */
+private fun plotsFor(stats: MilestoneStats, rangeStart: Long): List<Plot> {
+    val entries = stats.periodEntries
+    if (entries.isEmpty()) return emptyList()
+    if (stats.kind != MilestoneKind.Tally) {
+        return entries.map { Plot(it.epochDay, it.value) }
+    }
+    var running = 0.0
+    val climb = entries.map { entry ->
+        running += entry.value
+        Plot(entry.epochDay, running)
+    }
+    val floorDay = minOf(rangeStart, climb.first().epochDay)
+    return listOf(Plot(floorDay, 0.0)) + climb
+}
+
 @Composable
 private fun ProgressChart(
-    milestone: Milestone,
-    today: Long,
+    stats: MilestoneStats,
+    plots: List<Plot>,
+    range: Pair<Long, Long>,
     accent: Color,
     gridColor: Color,
     modifier: Modifier = Modifier,
 ) {
-    val chain = milestone.recordsByDate
+    val targets = remember(stats) {
+        stats.milestone.targetsIn(stats.periodKey).sortedBy { it.setOnEpochDay }
+    }
 
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -256,30 +313,41 @@ private fun ProgressChart(
                 .fillMaxSize()
                 .padding(horizontal = 14.dp, vertical = 14.dp),
         ) {
-            if (chain.isEmpty()) return@Canvas
+            if (plots.isEmpty()) return@Canvas
 
-            val values = chain.map { it.value }
-            val target = milestone.target
-            val minValue = minOf(values.min(), target ?: values.min())
-            val maxValue = maxOf(values.max(), target ?: values.max())
+            val values = plots.map { it.value }
+            // Targets join the y-range so an unmet goal is always on the
+            // chart, rather than sitting off the top edge where it can't be
+            // judged against.
+            val targetValues = targets.map { it.value }
+            val minValue = (values + targetValues).min()
+            val maxValue = (values + targetValues).max()
             val valueSpan = (maxValue - minValue).takeIf { it > 0.0 }
 
-            val firstDay = chain.first().epochDay
-            val lastDay = maxOf(today, chain.last().epochDay)
-            val daySpan = (lastDay - firstDay).takeIf { it > 0L }
+            val (rangeStart, rangeEnd) = range
+            val daySpan = (rangeEnd - rangeStart).takeIf { it > 0L }
 
             fun yFor(value: Double): Float {
                 val normalised = valueSpan?.let { ((value - minValue) / it).toFloat() } ?: 0.5f
                 return size.height * (1f - normalised)
             }
 
-            fun xFor(epochDay: Long): Float {
-                val normalised = daySpan?.let { (epochDay - firstDay).toFloat() / it.toFloat() }
-                    ?: 0.5f
-                return size.width * normalised
+            /**
+             * Everything logged on a single day gives a zero-width date range
+             * — the case every milestone starts in. Rather than stacking the
+             * points into a vertical bar at the midpoint, fall back to even
+             * index spacing so the shape is still readable on day one.
+             */
+            fun xFor(epochDay: Long, index: Int): Float {
+                val span = daySpan ?: return when {
+                    plots.size == 1 -> size.width / 2f
+                    else -> size.width * (index.toFloat() / (plots.size - 1))
+                }
+                return size.width *
+                    ((epochDay - rangeStart).toFloat() / span.toFloat()).coerceIn(0f, 1f)
             }
 
-            // Baseline so an otherwise-empty chart still has structure.
+            // Baseline so an otherwise-sparse chart still has structure.
             drawLine(
                 color = accent.copy(alpha = 0.20f),
                 start = Offset(0f, size.height),
@@ -287,10 +355,12 @@ private fun ProgressChart(
                 strokeWidth = 1.dp.toPx(),
             )
 
-            if (target != null) {
-                val y = yFor(target)
+            targets.forEach { target ->
+                val y = yFor(target.value)
                 drawLine(
-                    color = accent.copy(alpha = 0.65f),
+                    // A cleared target is history, so it recedes; the one
+                    // still being chased stays loud.
+                    color = accent.copy(alpha = if (target.isReached) 0.28f else 0.65f),
                     start = Offset(0f, y),
                     end = Offset(size.width, y),
                     strokeWidth = 1.5.dp.toPx(),
@@ -300,11 +370,11 @@ private fun ProgressChart(
                 )
             }
 
-            if (chain.size > 1) {
+            if (plots.size > 1) {
                 val path = Path().apply {
-                    moveTo(xFor(chain.first().epochDay), yFor(chain.first().value))
-                    chain.drop(1).forEach { record ->
-                        lineTo(xFor(record.epochDay), yFor(record.value))
+                    moveTo(xFor(plots.first().epochDay, 0), yFor(plots.first().value))
+                    plots.forEachIndexed { index, plot ->
+                        if (index > 0) lineTo(xFor(plot.epochDay, index), yFor(plot.value))
                     }
                 }
                 drawPath(
@@ -318,12 +388,61 @@ private fun ProgressChart(
                 )
             }
 
-            chain.forEach { record ->
+            plots.forEachIndexed { index, plot ->
                 drawCircle(
                     color = accent,
                     radius = 4.dp.toPx(),
-                    center = Offset(xFor(record.epochDay), yFor(record.value)),
+                    center = Offset(xFor(plot.epochDay, index), yFor(plot.value)),
                 )
+            }
+        }
+    }
+}
+
+/**
+ * How previous years went — the payoff of a yearly cadence, and the context
+ * that makes this year's number mean something.
+ */
+@Composable
+private fun PastYears(stats: MilestoneStats, today: Long, mutedColor: Color) {
+    val currentYear = yearOf(today)
+    val summaries = remember(stats.milestone.entries, currentYear) {
+        stats.milestone.entriesByDate
+            .groupBy { yearOf(it.epochDay) }
+            .filterKeys { it != currentYear }
+            .toSortedMap(compareByDescending { it })
+            .map { (year, entries) -> year to stats.milestone.valueOf(entries) }
+            .filter { it.second != null }
+    }
+    if (summaries.isEmpty()) return
+
+    Spacer(Modifier.height(10.dp))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        summaries.forEach { (year, value) ->
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    Text(
+                        text = year.toString(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = mutedColor,
+                    )
+                    Text(
+                        text = stats.unit.format(value ?: 0.0),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                    )
+                }
             }
         }
     }

@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.EmojiEvents
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -29,11 +30,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import dev.matejgroombridge.milestones.data.model.Milestone
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.data.model.MilestoneStats
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
 import dev.matejgroombridge.milestones.ui.theme.containerColor
@@ -42,35 +45,47 @@ import dev.matejgroombridge.milestones.ui.util.rememberHaptics
 
 /**
  * One milestone tile. Background uses the milestone's chosen pastel colour;
- * the icon tile uses the matching accent. Tap opens the log-a-record dialog;
- * long-press triggers [onLongClick] (used by the caller to open the overview).
+ * the icon tile uses the matching accent.
  *
- * The card's tint tracks how far along the goal is:
- *  - **No record yet** — pulled toward the screen background so it reads as
- *    an empty slot waiting to be filled.
- *  - **Has a record** — full pastel container.
- *  - **Target reached** — blended toward the accent so a completed goal pops
- *    out of the grid, with a small trophy next to the value.
+ * The card's content is what actually separates the app's two purposes, so it
+ * varies by kind × cadence:
+ *
+ * | | shows |
+ * |---|---|
+ * | Record × Lifetime | the best, and when it was set |
+ * | Record × Yearly   | this year's best, with the all-time best beneath |
+ * | Tally × Lifetime  | the running count |
+ * | Tally × Yearly    | this year's count, with the all-time total beneath |
+ *
+ * A target replaces the secondary line with a progress bar in every case, and
+ * a cleared target replaces it with the prompt to set the next one.
+ *
+ * Tap logs (instantly for a tally, via a dialog for a record); long-press
+ * opens the overview.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MilestoneCard(
-    milestone: Milestone,
+    stats: MilestoneStats,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val milestone = stats.milestone
     val color = MilestoneColors.entry(milestone.colorKey)
     val iconEntry = MilestoneIcons.entry(milestone.iconKey)
     val haptics = rememberHaptics()
 
+    val hasSomething = stats.periodEntryCount > 0
     val baseContainer = color.containerColor()
     val baseContent = color.contentColor()
     val screenBg = MaterialTheme.colorScheme.background
 
     val targetContainer = when {
-        milestone.targetReached -> blend(baseContainer, color.accent, 0.35f)
-        milestone.hasRecord -> baseContainer
+        // A cleared target is the loudest state on the grid — it's both an
+        // achievement and an outstanding decision.
+        stats.awaitingNewTarget -> blend(baseContainer, color.accent, 0.35f)
+        hasSomething -> baseContainer
         else -> blend(baseContainer, screenBg, 0.35f)
     }
     val containerColor by animateColorAsState(
@@ -100,7 +115,7 @@ fun MilestoneCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 MilestoneIconTile(
                     accent = color.accent,
-                    tinted = milestone.hasRecord,
+                    tinted = hasSomething,
                     icon = iconEntry.icon,
                     contentDescription = iconEntry.label,
                 )
@@ -118,19 +133,19 @@ fun MilestoneCard(
 
             Spacer(Modifier.height(10.dp))
 
-            // The record itself is the point of the card, so it gets the
-            // largest type on the tile rather than sitting in a subtitle.
+            // The number is the point of the card, so it gets the largest
+            // type on the tile rather than sitting in a subtitle.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = milestone.formattedBest,
+                    text = headlineFor(stats),
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.SemiBold,
-                    color = if (milestone.hasRecord) baseContent else baseContent.copy(alpha = 0.45f),
+                    color = if (hasSomething) baseContent else baseContent.copy(alpha = 0.45f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false),
                 )
-                if (milestone.targetReached) {
+                if (stats.awaitingNewTarget) {
                     Spacer(Modifier.width(6.dp))
                     Icon(
                         imageVector = Icons.Outlined.EmojiEvents,
@@ -143,7 +158,7 @@ fun MilestoneCard(
 
             Spacer(Modifier.height(6.dp))
             MilestoneSubtitle(
-                milestone = milestone,
+                stats = stats,
                 accent = color.accent,
                 color = baseContent.copy(alpha = 0.75f),
             )
@@ -151,11 +166,23 @@ fun MilestoneCard(
     }
 }
 
+/**
+ * The big number. A tally with a target reads as a fraction — "12 / 30" says
+ * more at a glance than "12" plus a percentage underneath.
+ */
+private fun headlineFor(stats: MilestoneStats): String {
+    val target = stats.activeTarget
+    if (stats.kind == MilestoneKind.Tally && target != null) {
+        return "${stats.formattedValue} / ${stats.unit.format(target.value)}"
+    }
+    return stats.formattedValue
+}
+
 @Composable
 private fun MilestoneIconTile(
     accent: Color,
     tinted: Boolean,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: ImageVector,
     contentDescription: String?,
 ) {
     val shape = RoundedCornerShape(14.dp)
@@ -176,33 +203,76 @@ private fun MilestoneIconTile(
 }
 
 /**
- * The line under the value. Priority order — a target is the most useful
- * thing to show, then how stale the record is, then a prompt to get started.
+ * The line under the number, in priority order: an outstanding decision beats
+ * a live goal, which beats context about where the number came from.
  */
 @Composable
 private fun MilestoneSubtitle(
-    milestone: Milestone,
+    stats: MilestoneStats,
     accent: Color,
     color: Color,
 ) {
-    val progress = milestone.targetProgress
+    val progress = stats.targetProgress
     when {
-        !milestone.hasRecord -> SubtitleText("Tap to set your first record", color)
+        stats.awaitingNewTarget -> Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = Icons.Outlined.Add,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(13.dp),
+            )
+            Spacer(Modifier.width(3.dp))
+            SubtitleText("Set a new target", color)
+        }
+
         progress != null -> TargetProgress(
             progress = progress,
-            label = if (milestone.targetReached) "Target reached"
-            else "${(progress * 100).toInt()}% of ${milestone.formattedTarget}",
+            // A tally already shows "12 / 30" up top, so repeating the target
+            // here would be noise — the percentage is the new information.
+            label = if (stats.kind == MilestoneKind.Tally) {
+                "${(progress * 100).toInt()}%"
+            } else {
+                "${(progress * 100).toInt()}% of ${stats.formattedTarget}"
+            },
             accent = accent,
             color = color,
         )
-        else -> {
-            val improvement = milestone.lastImprovement
-            val text = if (improvement != null) {
-                "${milestone.unit.formatMagnitude(improvement)} better than before"
+
+        stats.periodEntryCount == 0 -> SubtitleText(emptyPrompt(stats), color)
+
+        else -> SubtitleText(contextLine(stats), color)
+    }
+}
+
+private fun emptyPrompt(stats: MilestoneStats): String = when (stats.kind) {
+    MilestoneKind.Tally -> "Tap to add your first"
+    MilestoneKind.Record -> "Tap to set your first record"
+}
+
+/**
+ * Where the number came from, when there's no goal to show instead. Yearly
+ * milestones lead with the all-time figure — the most useful thing you can
+ * say about this year's number is how it sits against every other year.
+ */
+private fun contextLine(stats: MilestoneStats): String {
+    stats.formattedAllTimeIfDistinct?.let { allTime ->
+        return when (stats.kind) {
+            MilestoneKind.Tally -> "$allTime all time"
+            MilestoneKind.Record -> "Best ever $allTime"
+        }
+    }
+    return when (stats.kind) {
+        MilestoneKind.Tally -> {
+            val count = stats.periodEntryCount
+            "$count entr${if (count == 1) "y" else "ies"}"
+        }
+        MilestoneKind.Record -> {
+            val improvement = stats.lastImprovement
+            if (improvement != null) {
+                "${stats.unit.formatMagnitude(improvement)} better than before"
             } else {
-                "${milestone.records.size} record${if (milestone.records.size == 1) "" else "s"}"
+                "First record"
             }
-            SubtitleText(text, color)
         }
     }
 }
@@ -210,7 +280,7 @@ private fun MilestoneSubtitle(
 /**
  * Slim progress bar plus its caption. Drawn by hand rather than with
  * `LinearProgressIndicator` so the track can sit on the card's pastel
- * background at a low alpha instead of introducing a theme colour that
+ * background at a low alpha, instead of introducing a theme colour that
  * clashes with the milestone's own palette entry.
  */
 @Composable

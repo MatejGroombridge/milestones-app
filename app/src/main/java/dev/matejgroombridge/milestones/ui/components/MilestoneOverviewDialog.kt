@@ -18,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EmojiEvents
@@ -47,8 +48,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
-import dev.matejgroombridge.milestones.data.model.Milestone
-import dev.matejgroombridge.milestones.data.model.MilestoneRecord
+import dev.matejgroombridge.milestones.data.model.MilestoneCadence
+import dev.matejgroombridge.milestones.data.model.MilestoneEntry
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.data.model.MilestoneStats
+import dev.matejgroombridge.milestones.data.model.MilestoneTarget
+import dev.matejgroombridge.milestones.data.model.yearOf
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
 import java.time.LocalDate
@@ -57,31 +62,39 @@ import kotlin.math.abs
 
 /**
  * Read-only "milestone overview" sheet shown when the user long-presses a
- * card. Designed as a polished snapshot rather than a control surface — the
- * only edits available are the Edit button (which routes to
- * [MilestoneEditorDialog]) and deleting an individual record.
+ * card — a polished snapshot rather than a control surface.
  *
- * Surfaced metrics:
- *  - Large coloured icon badge using the milestone's accent.
- *  - Name + description + a chip describing how it's measured.
- *  - Three big stats: personal best, records set, total improvement.
- *  - A sparkline of the progression so the shape of the journey is visible.
- *  - The record history, newest first, each row deletable.
- *  - Footer line with tracking age / target progress.
+ * The only mutations available are the ones you can't reach from the grid:
+ * adding an entry with a note (a tally card's tap is an instant +1, so this is
+ * the way to record *what* you did), editing the milestone, and deleting an
+ * individual entry.
+ *
+ * Surfaced, all scoped to the current period:
+ *  - Name, description, and a chip describing how it's measured.
+ *  - Three stats, chosen by kind and cadence.
+ *  - A sparkline of the progression.
+ *  - The targets set against it, cleared and outstanding.
+ *  - The entry history, newest first, each row deletable.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MilestoneOverviewDialog(
-    milestone: Milestone,
+    stats: MilestoneStats,
     todayEpochDay: Long,
     onDismiss: () -> Unit,
     onEdit: () -> Unit,
-    onDeleteRecord: (String) -> Unit,
+    onAddEntry: () -> Unit,
+    onDeleteEntry: (String) -> Unit,
 ) {
+    val milestone = stats.milestone
     val color = MilestoneColors.entry(milestone.colorKey)
     val iconEntry = MilestoneIcons.entry(milestone.iconKey)
+    val isTally = stats.kind == MilestoneKind.Tally
 
-    val chain = remember(milestone.records) { milestone.recordsByDate }
+    val chain = stats.periodEntries
+    val targets = remember(milestone.targets, stats.periodKey) {
+        milestone.targetsIn(stats.periodKey).sortedBy { it.setOnEpochDay }
+    }
     val daysSinceCreated = (todayEpochDay - milestone.createdAtEpochDay).coerceAtLeast(0L)
 
     BasicAlertDialog(
@@ -98,12 +111,10 @@ fun MilestoneOverviewDialog(
         ) {
             Column(
                 modifier = Modifier
-                    .heightIn(max = 620.dp)
+                    .heightIn(max = 640.dp)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 18.dp),
             ) {
-                // Header row: large icon, name + measurement chip on the
-                // left; edit pinned to the right.
                 Row(
                     verticalAlignment = Alignment.Top,
                     modifier = Modifier.fillMaxWidth(),
@@ -124,9 +135,13 @@ fun MilestoneOverviewDialog(
                             softWrap = false,
                         )
                         Spacer(Modifier.height(4.dp))
-                        MeasurementChip(
-                            text = "${milestone.unit.label} · ${milestone.direction.shortLabel}",
-                            accent = color.accent,
+                        MeasurementChip(text = descriptorFor(stats), accent = color.accent)
+                    }
+                    IconButton(onClick = onAddEntry) {
+                        Icon(
+                            imageVector = Icons.Outlined.Add,
+                            contentDescription = if (isTally) "Add an entry" else "Log a record",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(onClick = onEdit) {
@@ -148,91 +163,162 @@ fun MilestoneOverviewDialog(
                 }
 
                 Spacer(Modifier.height(18.dp))
-
-                // Three big stat tiles. Equal-weight Row so they stretch to
-                // fill the dialog width regardless of value length.
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    StatTile(
-                        label = "Best",
-                        value = milestone.formattedBest,
-                        icon = Icons.Outlined.EmojiEvents,
-                        accent = color.accent,
-                        modifier = Modifier.weight(1f),
-                    )
-                    StatTile(
-                        label = "Records",
-                        value = milestone.records.size.toString(),
-                        icon = Icons.Outlined.Timeline,
-                        accent = color.accent,
-                        modifier = Modifier.weight(1f),
-                    )
-                    StatTile(
-                        label = "Improved",
-                        value = milestone.totalImprovement
-                            ?.let { milestone.unit.formatMagnitude(it) } ?: "—",
-                        icon = Icons.Outlined.Straighten,
-                        accent = color.accent,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                StatRow(stats = stats, todayEpochDay = todayEpochDay, accent = color.accent)
 
                 if (chain.isNotEmpty()) {
                     Spacer(Modifier.height(18.dp))
-                    Text(
-                        text = "Progression",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    SectionHeading("Progression")
                     Spacer(Modifier.height(8.dp))
                     Sparkline(
-                        values = chain.map { it.value },
+                        // A tally's shape is its climb, so plot the running
+                        // total rather than the individual amounts — otherwise
+                        // a column of +1s draws a flat line that says nothing.
+                        values = if (isTally) chain.runningTotals() else chain.map { it.value },
                         accent = color.accent,
                         trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
                     )
+                }
 
+                if (targets.isNotEmpty()) {
                     Spacer(Modifier.height(18.dp))
-                    Text(
-                        text = "Record history",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    SectionHeading("Targets")
                     Spacer(Modifier.height(8.dp))
-                    // Newest first: the most recent entries are the ones a
-                    // user is most likely to want to correct.
-                    chain.asReversed().forEachIndexed { indexFromEnd, record ->
-                        val previous = chain.getOrNull(chain.lastIndex - indexFromEnd - 1)
-                        RecordRow(
-                            milestone = milestone,
-                            record = record,
-                            improvement = previous?.let { abs(record.value - it.value) },
-                            isBest = record.id == milestone.best?.id,
-                            accent = color.accent,
-                            onDelete = { onDeleteRecord(record.id) },
-                        )
+                    targets.asReversed().forEach { target ->
+                        TargetRow(target = target, stats = stats, accent = color.accent)
                         Spacer(Modifier.height(6.dp))
                     }
-                } else {
-                    Spacer(Modifier.height(18.dp))
+                }
+
+                Spacer(Modifier.height(18.dp))
+                if (chain.isEmpty()) {
                     Text(
-                        text = "No records yet — tap the card to log your first.",
+                        text = if (isTally) "Nothing logged yet — tap the card to add one."
+                        else "No records yet — tap the card to set your first.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                } else {
+                    SectionHeading(if (isTally) "Entries" else "Record history")
+                    Spacer(Modifier.height(8.dp))
+                    // Newest first: the most recent entries are the ones a
+                    // user is most likely to want to correct.
+                    chain.asReversed().forEachIndexed { indexFromEnd, entry ->
+                        val previous = chain.getOrNull(chain.lastIndex - indexFromEnd - 1)
+                        EntryRow(
+                            stats = stats,
+                            entry = entry,
+                            improvement = if (isTally) null
+                            else previous?.let { abs(entry.value - it.value) },
+                            isBest = !isTally && entry.id == stats.bestEntry?.id,
+                            accent = color.accent,
+                            onDelete = { onDeleteEntry(entry.id) },
+                        )
+                        Spacer(Modifier.height(6.dp))
+                    }
                 }
 
                 Spacer(Modifier.height(16.dp))
-                FooterStats(milestone = milestone, daysSinceCreated = daysSinceCreated)
+                FooterStats(stats = stats, daysSinceCreated = daysSinceCreated)
             }
         }
     }
+}
+
+/** Running totals for a tally, in entry order. */
+private fun List<MilestoneEntry>.runningTotals(): List<Double> {
+    var running = 0.0
+    return map { running += it.value; running }
+}
+
+/** "Running total · Each year · books" — how this milestone is set up, in one line. */
+private fun descriptorFor(stats: MilestoneStats): String = buildString {
+    append(stats.kind.label)
+    append(" · ")
+    append(stats.cadence.label)
+    if (stats.kind == MilestoneKind.Record) {
+        append(" · ")
+        append(stats.milestone.direction.shortLabel)
+    }
+}
+
+/**
+ * Three stats. The first two are always the headline number and how many
+ * entries produced it; the third is whichever comparison is most useful —
+ * the all-time figure for a yearly milestone, and otherwise how far the
+ * milestone has travelled.
+ */
+@Composable
+private fun StatRow(stats: MilestoneStats, todayEpochDay: Long, accent: Color) {
+    val isTally = stats.kind == MilestoneKind.Tally
+    val thirdLabel: String
+    val thirdValue: String
+    when {
+        // A yearly milestone's most useful comparison is how this year sits
+        // against every year; a lifetime one's is how far it has travelled,
+        // except for a lifetime tally where "how much of it was this year"
+        // is the more interesting cut.
+        stats.cadence == MilestoneCadence.Yearly -> {
+            thirdLabel = "All time"
+            thirdValue = stats.allTimeValue?.let { stats.unit.format(it) } ?: "—"
+        }
+        isTally -> {
+            thirdLabel = "This year"
+            val currentYear = yearOf(todayEpochDay)
+            thirdValue = stats.unit.format(
+                stats.milestone.entriesByDate
+                    .filter { yearOf(it.epochDay) == currentYear }
+                    .sumOf { it.value },
+            )
+        }
+        else -> {
+            thirdLabel = "Improved"
+            val first = stats.periodEntries.firstOrNull()?.value
+            val best = stats.value
+            thirdValue = if (first != null && best != null && stats.periodEntries.size > 1) {
+                stats.unit.formatMagnitude(abs(best - first))
+            } else "—"
+        }
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        StatTile(
+            label = if (isTally) "Total" else "Best",
+            value = stats.formattedValue,
+            icon = Icons.Outlined.EmojiEvents,
+            accent = accent,
+            modifier = Modifier.weight(1f),
+        )
+        StatTile(
+            label = "Entries",
+            value = stats.periodEntryCount.toString(),
+            icon = Icons.Outlined.Timeline,
+            accent = accent,
+            modifier = Modifier.weight(1f),
+        )
+        StatTile(
+            label = thirdLabel,
+            value = thirdValue,
+            icon = Icons.Outlined.Straighten,
+            accent = accent,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun SectionHeading(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Medium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable
@@ -313,23 +399,65 @@ private fun StatTile(
     }
 }
 
+/** One target: what it was, and whether it's been cleared. */
+@Composable
+private fun TargetRow(target: MilestoneTarget, stats: MilestoneStats, accent: Color) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = if (target.isReached) accent.copy(alpha = 0.18f)
+        else MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stats.unit.format(target.value),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = target.reachedOnEpochDay?.let {
+                        "Reached ${LocalDate.ofEpochDay(it).format(ENTRY_DATE_FORMAT)}"
+                    } ?: "Chasing since ${
+                        LocalDate.ofEpochDay(target.setOnEpochDay).format(ENTRY_DATE_FORMAT)
+                    }",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (target.isReached) {
+                Icon(
+                    imageVector = Icons.Outlined.EmojiEvents,
+                    contentDescription = "Reached",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+    }
+}
+
 /**
- * One row of the record history: when, what, how much better, and a delete
- * affordance.
+ * One row of the entry history: what, when, and a delete affordance.
  *
- * Delete is the only way to undo a mistyped record — an unbeatable typo would
- * otherwise lock the milestone forever — so it's always visible rather than
- * hidden behind a long-press.
+ * Delete is the only way to undo a mistyped entry — an unbeatable typo would
+ * otherwise lock a record milestone forever — so it's always visible rather
+ * than hidden behind a long-press.
  */
 @Composable
-private fun RecordRow(
-    milestone: Milestone,
-    record: MilestoneRecord,
+private fun EntryRow(
+    stats: MilestoneStats,
+    entry: MilestoneEntry,
     improvement: Double?,
     isBest: Boolean,
     accent: Color,
     onDelete: () -> Unit,
 ) {
+    val isTally = stats.kind == MilestoneKind.Tally
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = if (isBest) accent.copy(alpha = 0.18f)
@@ -343,7 +471,10 @@ private fun RecordRow(
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = milestone.unit.format(record.value),
+                        // A tally's note is the interesting part — "Japan"
+                        // beats "+1" — so it leads when there is one.
+                        text = if (isTally && entry.note.isNotBlank()) entry.note
+                        else stats.unit.format(entry.value),
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -362,14 +493,18 @@ private fun RecordRow(
                 }
                 Text(
                     text = buildString {
-                        append(LocalDate.ofEpochDay(record.epochDay).format(RECORD_DATE_FORMAT))
+                        append(LocalDate.ofEpochDay(entry.epochDay).format(ENTRY_DATE_FORMAT))
+                        if (isTally && entry.note.isNotBlank()) {
+                            append(" · +")
+                            append(stats.unit.formatMagnitude(entry.value))
+                        }
                         if (improvement != null) {
                             append(" · +")
-                            append(milestone.unit.formatMagnitude(improvement))
+                            append(stats.unit.formatMagnitude(improvement))
                         }
-                        if (record.note.isNotBlank()) {
+                        if (!isTally && entry.note.isNotBlank()) {
                             append(" · ")
-                            append(record.note)
+                            append(entry.note)
                         }
                     },
                     style = MaterialTheme.typography.bodySmall,
@@ -381,7 +516,7 @@ private fun RecordRow(
             IconButton(onClick = onDelete) {
                 Icon(
                     imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = "Delete record",
+                    contentDescription = "Delete entry",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(18.dp),
                 )
@@ -391,12 +526,12 @@ private fun RecordRow(
 }
 
 /**
- * Minimal line chart of the record chain, plotted by index rather than date.
+ * Minimal line chart, plotted by index rather than date.
  *
- * Index spacing is deliberate here: this is a "shape of the journey" glance,
- * and evenly-spaced points keep a milestone whose records are years apart
- * from collapsing into a flat line with one spike. The Progress screen plots
- * the same data against real dates when the timing matters.
+ * Index spacing is deliberate: this is a "shape of the journey" glance, and
+ * evenly-spaced points keep a milestone whose entries are years apart from
+ * collapsing into a flat line with one spike. The Progress screen plots the
+ * same data against real dates when the timing matters.
  */
 @Composable
 private fun Sparkline(
@@ -410,7 +545,11 @@ private fun Sparkline(
         color = trackColor.copy(alpha = 0.5f),
         modifier = modifier,
     ) {
-        Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 10.dp)) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
             if (values.isEmpty()) return@Canvas
             val minValue = values.min()
             val maxValue = values.max()
@@ -419,8 +558,8 @@ private fun Sparkline(
             fun pointAt(index: Int): Offset {
                 val x = if (values.size == 1) size.width / 2f
                 else size.width * (index.toFloat() / (values.size - 1))
-                // A flat run (single record, or several identical values)
-                // has no range to scale against, so it sits on the midline.
+                // A flat run (single entry, or several identical values) has
+                // no range to scale against, so it sits on the midline.
                 val normalised = span?.let { ((values[index] - minValue) / it).toFloat() } ?: 0.5f
                 return Offset(x, size.height * (1f - normalised))
             }
@@ -429,8 +568,8 @@ private fun Sparkline(
                 val path = Path().apply {
                     moveTo(pointAt(0).x, pointAt(0).y)
                     for (i in 1 until values.size) {
-                        val p = pointAt(i)
-                        lineTo(p.x, p.y)
+                        val point = pointAt(i)
+                        lineTo(point.x, point.y)
                     }
                 }
                 drawPath(
@@ -451,7 +590,7 @@ private fun Sparkline(
 }
 
 @Composable
-private fun FooterStats(milestone: Milestone, daysSinceCreated: Long) {
+private fun FooterStats(stats: MilestoneStats, daysSinceCreated: Long) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -462,12 +601,12 @@ private fun FooterStats(milestone: Milestone, daysSinceCreated: Long) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        val progress = milestone.targetProgress
+        val progress = stats.targetProgress
         Text(
             text = when {
+                stats.awaitingNewTarget -> "Target reached"
                 progress == null -> "No target"
-                milestone.targetReached -> "Target reached"
-                else -> "${(progress * 100).toInt()}% of ${milestone.formattedTarget}"
+                else -> "${(progress * 100).toInt()}% of ${stats.formattedTarget}"
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -475,4 +614,4 @@ private fun FooterStats(milestone: Milestone, daysSinceCreated: Long) {
     }
 }
 
-private val RECORD_DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM yyyy")
+private val ENTRY_DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM yyyy")

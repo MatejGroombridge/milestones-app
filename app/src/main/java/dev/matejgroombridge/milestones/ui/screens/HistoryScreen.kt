@@ -46,8 +46,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.matejgroombridge.milestones.data.model.MilestoneKind
+import dev.matejgroombridge.milestones.ui.HistoryItem
 import dev.matejgroombridge.milestones.ui.HomeViewModel
-import dev.matejgroombridge.milestones.ui.RecordEntry
 import dev.matejgroombridge.milestones.ui.theme.MilestoneColors
 import dev.matejgroombridge.milestones.ui.theme.MilestoneIcons
 import dev.matejgroombridge.milestones.ui.theme.containerColor
@@ -57,12 +58,13 @@ import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
 /**
- * Every personal best across every active milestone, newest first — the
- * "what have I actually beaten lately?" view.
+ * Everything that has happened across every active milestone, newest first —
+ * the "what have I actually done lately?" view.
  *
- * Entries are grouped under month headings, which is the natural granularity
- * for records: they arrive in ones and twos over weeks, not many per day.
- * Long-pressing a row offers to delete that record.
+ * Entries are grouped under month headings, the natural granularity for a
+ * tracker where things arrive in ones and twos over weeks. Clearing a target
+ * gets its own row, because it's the moment worth remembering.
+ * Long-pressing a logged row offers to delete it.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -71,7 +73,7 @@ fun HistoryScreen(
     contentPadding: PaddingValues,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    var pendingDelete by remember { mutableStateOf<RecordEntry?>(null) }
+    var pendingDelete by remember { mutableStateOf<HistoryItem.Logged?>(null) }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -84,13 +86,13 @@ fun HistoryScreen(
             )
         },
     ) { padding ->
-        if (state.recentRecords.isEmpty()) {
+        if (state.history.isEmpty()) {
             EmptyState(
                 modifier = Modifier.padding(padding),
-                message = if (state.activeMilestones.isEmpty()) {
+                message = if (state.hasNoMilestones) {
                     "No milestones yet.\nAdd one on the Milestones tab."
                 } else {
-                    "No records yet.\nTap a milestone to log your first."
+                    "Nothing logged yet.\nTap a milestone to get started."
                 },
             )
             return@Scaffold
@@ -109,42 +111,48 @@ fun HistoryScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             // The feed is already sorted newest-first, so a heading is needed
-            // exactly when an entry's month differs from its predecessor's.
-            state.recentRecords.forEachIndexed { index, entry ->
-                val month = LocalDate.ofEpochDay(entry.record.epochDay).withDayOfMonth(1)
-                val previousMonth = state.recentRecords.getOrNull(index - 1)
-                    ?.let { LocalDate.ofEpochDay(it.record.epochDay).withDayOfMonth(1) }
+            // exactly when an item's month differs from its predecessor's.
+            state.history.forEachIndexed { index, item ->
+                val month = LocalDate.ofEpochDay(item.epochDay).withDayOfMonth(1)
+                val previousMonth = state.history.getOrNull(index - 1)
+                    ?.let { LocalDate.ofEpochDay(it.epochDay).withDayOfMonth(1) }
                 if (month != previousMonth) {
                     item(key = "header-${month.year}-${month.monthValue}") {
                         MonthHeader(month.format(MONTH_FORMAT))
                     }
                 }
-                item(key = entry.record.id) {
-                    HistoryRow(
-                        entry = entry,
-                        isCurrentBest = entry.record.id == entry.milestone.best?.id,
-                        onRequestDelete = { pendingDelete = entry },
-                    )
+                when (item) {
+                    is HistoryItem.Logged -> item(key = "entry-${item.entry.id}") {
+                        LoggedRow(item = item, onRequestDelete = { pendingDelete = item })
+                    }
+                    is HistoryItem.TargetCleared -> item(key = "target-${item.target.id}") {
+                        TargetClearedRow(item = item)
+                    }
                 }
             }
         }
     }
 
-    pendingDelete?.let { entry ->
+    pendingDelete?.let { item ->
+        val milestone = item.milestone
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete Record?") },
+            title = { Text("Delete Entry?") },
             text = {
                 Text(
-                    "${entry.milestone.unit.format(entry.record.value)} on " +
-                        "${LocalDate.ofEpochDay(entry.record.epochDay).format(FULL_DATE_FORMAT)} " +
-                        "will be removed from \"${entry.milestone.name}\". If it's the " +
-                        "current best, the record before it takes over.",
+                    "${milestone.unit.format(item.entry.value)} on " +
+                        "${LocalDate.ofEpochDay(item.entry.epochDay).format(FULL_DATE_FORMAT)} " +
+                        "will be removed from \"${milestone.name}\"." +
+                        if (milestone.kind == MilestoneKind.Record) {
+                            " If it's the current best, the record before it takes over."
+                        } else {
+                            " The total drops by that much."
+                        },
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.deleteRecord(entry.milestone.id, entry.record.id)
+                    viewModel.deleteEntry(milestone.id, item.entry.id)
                     pendingDelete = null
                 }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
             },
@@ -168,16 +176,16 @@ private fun MonthHeader(text: String) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun HistoryRow(
-    entry: RecordEntry,
-    isCurrentBest: Boolean,
+private fun LoggedRow(
+    item: HistoryItem.Logged,
     onRequestDelete: () -> Unit,
 ) {
-    val milestone = entry.milestone
+    val milestone = item.milestone
     val color = MilestoneColors.entry(milestone.colorKey)
     val iconEntry = MilestoneIcons.entry(milestone.iconKey)
     val haptics = rememberHaptics()
     var menuOpen by remember { mutableStateOf(false) }
+    val isTally = milestone.kind == MilestoneKind.Tally
 
     Box {
         Surface(
@@ -222,7 +230,7 @@ private fun HistoryRow(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        if (isCurrentBest) {
+                        if (item.isPeriodBest) {
                             Spacer(Modifier.width(5.dp))
                             Icon(
                                 imageVector = Icons.Outlined.EmojiEvents,
@@ -234,17 +242,21 @@ private fun HistoryRow(
                     }
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        text = milestone.unit.format(entry.record.value),
+                        // A tally's note is what actually happened — "Japan"
+                        // says more than "+1" ever could.
+                        text = if (isTally && item.entry.note.isNotBlank()) item.entry.note
+                        else milestone.unit.format(item.entry.value),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = color.contentColor(),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (entry.record.note.isNotBlank()) {
+                    val caption = buildCaption(item)
+                    if (caption != null) {
                         Spacer(Modifier.height(2.dp))
                         Text(
-                            text = entry.record.note,
+                            text = caption,
                             style = MaterialTheme.typography.bodySmall,
                             color = color.contentColor().copy(alpha = 0.75f),
                             maxLines = 2,
@@ -255,14 +267,17 @@ private fun HistoryRow(
                 Spacer(Modifier.width(10.dp))
                 Column(horizontalAlignment = Alignment.End) {
                     Text(
-                        text = LocalDate.ofEpochDay(entry.record.epochDay).format(DAY_FORMAT),
+                        text = LocalDate.ofEpochDay(item.entry.epochDay).format(DAY_FORMAT),
                         style = MaterialTheme.typography.labelMedium,
                         color = color.contentColor().copy(alpha = 0.75f),
                     )
-                    if (entry.improvement != null) {
+                    val badge = item.improvement?.let { milestone.unit.formatMagnitude(it) }
+                        ?: item.runningTotal?.let { milestone.unit.format(it) }
+                    if (badge != null) {
                         Spacer(Modifier.height(4.dp))
-                        ImprovementPill(
-                            text = milestone.unit.formatMagnitude(entry.improvement),
+                        ValuePill(
+                            text = badge,
+                            showArrow = item.improvement != null,
                             accent = color.accent,
                             contentColor = color.contentColor(),
                         )
@@ -275,7 +290,7 @@ private fun HistoryRow(
             onDismissRequest = { menuOpen = false },
         ) {
             DropdownMenuItem(
-                text = { Text("Delete Record") },
+                text = { Text("Delete Entry") },
                 leadingIcon = {
                     Icon(imageVector = Icons.Outlined.DeleteOutline, contentDescription = null)
                 },
@@ -288,9 +303,88 @@ private fun HistoryRow(
     }
 }
 
-/** Small "how much better" badge — an up arrow reads as progress in either direction. */
+/**
+ * Whatever didn't make it into the headline. A tally leading with its note
+ * still owes the reader the amount; a record leading with its value still
+ * owes them the note.
+ */
+private fun buildCaption(item: HistoryItem.Logged): String? {
+    val milestone = item.milestone
+    val isTally = milestone.kind == MilestoneKind.Tally
+    return when {
+        isTally && item.entry.note.isNotBlank() ->
+            "+${milestone.unit.formatMagnitude(item.entry.value)}"
+        !isTally && item.entry.note.isNotBlank() -> item.entry.note
+        else -> null
+    }
+}
+
+/** The moment a target fell — visually distinct from a plain entry. */
 @Composable
-private fun ImprovementPill(text: String, accent: Color, contentColor: Color) {
+private fun TargetClearedRow(item: HistoryItem.TargetCleared) {
+    val milestone = item.milestone
+    val color = MilestoneColors.entry(milestone.colorKey)
+
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = color.accent.copy(alpha = 0.45f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(color.accent),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.EmojiEvents,
+                    contentDescription = null,
+                    tint = Color.Black.copy(alpha = 0.85f),
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = milestone.name,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = color.contentColor().copy(alpha = 0.75f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "Target reached · ${milestone.unit.format(item.target.value)}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = color.contentColor(),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = LocalDate.ofEpochDay(item.epochDay).format(DAY_FORMAT),
+                style = MaterialTheme.typography.labelMedium,
+                color = color.contentColor().copy(alpha = 0.75f),
+            )
+        }
+    }
+}
+
+/** Trailing badge — an improvement for a record, the running total for a tally. */
+@Composable
+private fun ValuePill(
+    text: String,
+    showArrow: Boolean,
+    accent: Color,
+    contentColor: Color,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -298,13 +392,15 @@ private fun ImprovementPill(text: String, accent: Color, contentColor: Color) {
             .background(accent.copy(alpha = 0.45f))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     ) {
-        Icon(
-            imageVector = Icons.Outlined.ArrowUpward,
-            contentDescription = "Improvement",
-            tint = contentColor,
-            modifier = Modifier.size(11.dp),
-        )
-        Spacer(Modifier.width(2.dp))
+        if (showArrow) {
+            Icon(
+                imageVector = Icons.Outlined.ArrowUpward,
+                contentDescription = "Improvement",
+                tint = contentColor,
+                modifier = Modifier.size(11.dp),
+            )
+            Spacer(Modifier.width(2.dp))
+        }
         Text(
             text = text,
             style = MaterialTheme.typography.labelSmall,
