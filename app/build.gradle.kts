@@ -29,8 +29,7 @@ android {
         applicationId = "dev.matejgroombridge.milestones"
         minSdk = 26          // Android 8.0+ (covers ~95% of devices, allows modern APIs)
         targetSdk = 35       // Android 15
-        // Pre-release baseline. `bin/changeset` bumps these on every release —
-        // the first cut takes this to 0.1.0 / versionCode 1.
+        // Bumped by `bin/changeset` on every release — don't edit by hand.
         versionCode = 2
         versionName = "0.2.0"
     }
